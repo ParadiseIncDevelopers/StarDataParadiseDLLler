@@ -14,10 +14,20 @@ CMake, bağımlılık kaynaklarını ve Server v1 sözleşmesini SHA-256 ile do�
 ## Paket tüketicisi ve tanılama
 
 ```powershell
-python tests/package_integration.py --package out/packages/StarDataParadiseDLLler-0.1.0-win-x64.zip --server <Server.exe> --openssl <openssl.exe> --scratch out/integration
+python tests/package_integration.py --package out/packages/StarDataParadiseDLLler-0.2.0-win-x64.zip --server <Server.exe> --openssl <openssl.exe> --scratch out/integration
 ```
 
-Script geçici yerel TLS sertifikaları üretir ve ayrı bir Windows instance'ı loopback üzerinde çalıştırır. Örnek tüketiciyi ZIP'ten açılan CMake paketi ile derler ve bağlantı, capability, SQL unavailable, ret, timeout, iptal, bağlantı kaybı ve kapanışı doğrular.
+Script geçici yerel TLS sertifikaları üretir ve ayrı bir Windows instance'ı loopback üzerinde çalıştırır. Örnek tüketiciyi ZIP'ten açılan CMake paketi ile derler ve bağlantı, capability, SQL unavailable, ret, timeout, iptal, bağlantı kaybı ve kapanışı doğrular. Etap 12 Server ile `--sql` kullanıldığında ayrı bir veri deposu başlatır ve tipli CRUD, batch, savepoint, sonuç iptali, kayıp commit yanıtı ve restart sonrası outcome kontrollerini de çalıştırır.
+
+Etap 15 Server ile `--security` de eklenebilir. Ayrı TLS fixture'ı, kullanıcı ve rol değişikliklerini, yeniden kullanımda reset, yetki revoke, parola yenileme ve oturum kapatmayı doğrular.
+
+Etap 17 Server ile `--plsql` kurulu paket üzerinden OUT, adlandırılmış cursor setleri ve iç içe RECORD/COLLECTION gidiş-dönüşünü doğrular.
+
+Etap 18 Server ile `--debugger` gerçek bir kontrol bağlantısı ve ayrı bir hedef bağlantıyla breakpoint, watch, step, ölçüm, isolated routine test ve kontrol bağlantısı kapanırken rollback’i doğrular.
+
+Etap 19 Server ile `--history`, Native LOG, DIFF ve READ çağrılarını, primary-key değişiminde satır kimliğini, History yetkisini ve revision pin/retention davranışını ayrı bir TLS fixture’ında doğrular.
+
+Etap 20 Server ile `--restore`, silinen satırı aynı kimlikle geri almayı, eskimiş önizleme reddini, ayrı TLS bağlantısından token replay ve bağımsız alan güncellemesini koruyan REVERT’i doğrular.
 
 MSVC AddressSanitizer için ayrı bir derleme dizini ve `-DSDP_ADDRESS_SANITIZER=ON` kullan. Visual Studio ASan x64 runtime dizinini test sürecinin PATH değişkenine ekle. Örnek tüketici de `package_integration.py --asan` ile enstrümante edilir. ASan paketi tanılama içindir.
 

@@ -2,5 +2,5 @@
 
 int main(void)
 {
-    return sdp_library_version() == 0x00000100u ? 0 : 1;
+    return sdp_library_version() == 0x00000200u ? 0 : 1;
 }

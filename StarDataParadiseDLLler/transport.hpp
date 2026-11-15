@@ -24,13 +24,22 @@ struct Endpoint
     std::filesystem::path ca_file;
 };
 
+struct PasswordChange
+{
+    std::string_view username;
+    std::string_view old_password;
+    std::string_view new_password;
+    std::string_view token;
+};
+
 class Transport
 {
 public:
     explicit Transport(std::chrono::milliseconds timeout);
     std::string open(const Endpoint& endpoint, std::string_view username, std::string_view password);
     void health();
-    std::string prepare(std::string_view sql);
+    wire::Json request(std::string_view op, wire::Json body, bool& dispatched);
+    void password_set(const PasswordChange& change, bool& dispatched);
     void begin(uint64_t operation) noexcept;
     void cancel(uint64_t operation);
     void close() noexcept;
@@ -47,9 +56,12 @@ private:
     void disconnect() noexcept;
     asio::awaitable<std::string> connect(const Endpoint& endpoint, std::string_view username,
         std::string_view password, Deadline deadline);
-    asio::awaitable<wire::Json> exchange(wire::Json packet, Deadline deadline, bool auth = false);
+    asio::awaitable<wire::Json> exchange(wire::Json packet, Deadline deadline, bool* dispatched = nullptr);
+    asio::awaitable<wire::Json> exchange_packet(wire::Json& packet, Deadline deadline, bool* dispatched,
+        bool contains_credentials = false);
     asio::awaitable<void> health_request();
-    asio::awaitable<std::string> prepare_request(std::string_view sql);
+    asio::awaitable<wire::Json> request_operation(std::string_view op, wire::Json body, bool& dispatched);
+    asio::awaitable<void> password_request(const PasswordChange& change, bool& dispatched);
     asio::awaitable<void> shutdown();
 
     template<class Result>

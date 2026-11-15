@@ -21,21 +21,23 @@ struct SecretBytes
     ~SecretBytes() { OPENSSL_cleanse(bytes.data(), bytes.size()); }
 };
 
+void clear_credentials(Json& message) noexcept
+{
+    auto body = message.find("body");
+    if (body == message.end() || !body->is_object()) return;
+    for (const auto field : {"password", "old_password", "new_password"})
+    {
+        auto secret = body->find(field);
+        if (secret == body->end()) continue;
+        if (auto* bytes = secret->get_ptr<std::string*>())
+            OPENSSL_cleanse(bytes->data(), bytes->size());
+    }
+}
+
 struct ClearWireRequest
 {
     Json& message;
-    bool auth;
-    ~ClearWireRequest() { clear(); }
-
-    void clear()
-    {
-        if (auth)
-        {
-            auto& password = message["body"]["password"].get_ref<std::string&>();
-            OPENSSL_cleanse(password.data(), password.size());
-            auth = false;
-        }
-    }
+    ~ClearWireRequest() { clear_credentials(message); }
 };
 
 template<size_t N>
@@ -80,6 +82,28 @@ RemoteError decode_remote_error(const Json& error, std::string_view session, uin
     result.column = source_position(error.at("column"));
     copy_text(result.sqlstate, description.state);
     copy_text(result.message, description.message);
+    const auto history_reason = error.find("history_reason");
+    if (history_reason != error.end() && (result.code == SDP_INVALID_STATE || result.code == SDP_RESOURCE_LIMIT))
+    {
+        if (*history_reason == "revision_not_recoverable")
+            copy_text(result.message, "Historical revision is no longer recoverable (revision_not_recoverable)");
+        else if (*history_reason == "retention_pinned")
+            copy_text(result.message, "Historical retention is blocked by a pin (retention_pinned)");
+        else if (*history_reason == "object_identity_changed")
+            copy_text(result.message, "Historical object identity changed (object_identity_changed)");
+        else if (*history_reason == "stale_preview")
+            copy_text(result.message, "History preview is stale (stale_preview)");
+        else if (*history_reason == "restore_conflict")
+            copy_text(result.message, "Historical data conflicts with current data (restore_conflict)");
+        else if (*history_reason == "schema_conflict")
+            copy_text(result.message, "Historical schema conflicts with current schema (schema_conflict)");
+        else if (*history_reason == "plan_unknown")
+            copy_text(result.message, "History preview is unavailable (plan_unknown)");
+        else if (*history_reason == "request_conflict")
+            copy_text(result.message, "History request token conflicts with its prior use (request_conflict)");
+    }
+    if (result.code == SDP_INTERNAL_ERROR && history_reason != error.end() && *history_reason == "history_integrity")
+        copy_text(result.message, "Historical integrity verification failed (history_integrity)");
     const auto& correlation = error.at("correlation_id");
     if (correlation.is_string() && !session.empty() &&
         correlation == std::string(session) + "-" + std::to_string(id))
@@ -176,19 +200,19 @@ asio::awaitable<std::string> Transport::connect(const Endpoint& endpoint, std::s
     check(error, true);
 
     const auto hello = co_await exchange(wire::request(next_id_++, "hello",
-        Json{{"client", "StarDataParadiseDLLler/0.1.0"}}), deadline);
+        Json{{"client", "StarDataParadiseDLLler/0.2.0"}}), deadline);
     session_ = wire::string_field(hello, "session_id");
     const auto protocol = hello.find("protocol_version");
     if (!hex_id(session_) || protocol == hello.end() || !protocol->is_number_integer() || *protocol != wire::version)
         throw Error(Code::incompatible);
     wire::string_field(hello, "product_version");
 
-    Json credentials = Json::object();
+    auto auth_request = wire::request(next_id_++, "auth");
+    const ClearWireRequest scrub{auth_request};
+    auto& credentials = auth_request["body"];
     credentials["username"] = username;
     credentials["password"] = password;
-    const auto auth_packet_id = next_id_++;
-    auto auth_request = wire::request(auth_packet_id, "auth", std::move(credentials));
-    Json auth = co_await exchange(std::move(auth_request), deadline, true);
+    Json auth = co_await exchange_packet(auth_request, deadline, nullptr, true);
     const auto authenticated = auth.find("authenticated");
     if (authenticated == auth.end() || !authenticated->is_boolean()) throw Error(Code::malformed);
     if (!authenticated->get<bool>()) throw Error(Code::auth_failed);
@@ -204,9 +228,14 @@ asio::awaitable<std::string> Transport::connect(const Endpoint& endpoint, std::s
     co_return wire::serialize(features);
 }
 
-asio::awaitable<Json> Transport::exchange(Json packet, Deadline deadline, bool auth)
+asio::awaitable<Json> Transport::exchange(Json packet, Deadline deadline, bool* dispatched)
 {
-    ClearWireRequest scrub{packet, auth};
+    co_return co_await exchange_packet(packet, deadline, dispatched);
+}
+
+asio::awaitable<Json> Transport::exchange_packet(Json& packet, Deadline deadline, bool* dispatched,
+    bool contains_credentials)
+{
     try
     {
         const auto id = wire::request_id(packet);
@@ -214,10 +243,12 @@ asio::awaitable<Json> Transport::exchange(Json packet, Deadline deadline, bool a
         const auto header = wire::header_for(payload.bytes.size());
         const std::array<asio::const_buffer, 2> buffers{asio::buffer(header), asio::buffer(payload.bytes)};
         asio::error_code error;
-        co_await asio::async_write(stream_, buffers, token(deadline, error));
+        auto write_token = token(deadline, error);
+        if (dispatched) *dispatched = true;
+        co_await asio::async_write(stream_, buffers, std::move(write_token));
         OPENSSL_cleanse(payload.bytes.data(), payload.bytes.size());
         check(error);
-        scrub.clear();
+        if (contains_credentials) clear_credentials(packet);
 
         wire::FrameHeader response_header{};
         co_await asio::async_read(stream_, asio::buffer(response_header), token(deadline, error));
@@ -248,19 +279,39 @@ asio::awaitable<void> Transport::health_request()
     if (wire::string_field(result, "status").empty()) throw Error(Code::malformed);
 }
 
-asio::awaitable<std::string> Transport::prepare_request(std::string_view sql)
+asio::awaitable<Json> Transport::request_operation(std::string_view op, Json body, bool& dispatched)
 {
     if (!connected()) throw Error(Code::connection_lost);
     if (!next_id_) throw Error(Code::invalid_state);
-    Json body{{"sql", sql}};
-    const auto result = co_await exchange(wire::request(next_id_++, "query.prepare", std::move(body)),
-        std::chrono::steady_clock::now() + timeout_);
-    co_return wire::string_field(result, "statement_id");
+    co_return co_await exchange(wire::request(next_id_++, op, std::move(body)),
+        std::chrono::steady_clock::now() + timeout_, &dispatched);
+}
+
+asio::awaitable<void> Transport::password_request(const PasswordChange& change, bool& dispatched)
+{
+    if (!connected()) throw Error(Code::connection_lost);
+    if (!next_id_) throw Error(Code::invalid_state);
+    auto packet = wire::request(next_id_++, "password_set");
+    const ClearWireRequest scrub{packet};
+    auto& body = packet["body"];
+    body["username"] = change.username;
+    body["request_token"] = change.token;
+    body["new_password"] = change.new_password;
+    if (!change.old_password.empty()) body["old_password"] = change.old_password;
+    (void)co_await exchange_packet(packet, std::chrono::steady_clock::now() + timeout_, &dispatched, true);
+}
+
+void Transport::password_set(const PasswordChange& change, bool& dispatched)
+{
+    execute(password_request(change, dispatched));
 }
 
 void Transport::health() { execute(health_request()); }
 
-std::string Transport::prepare(std::string_view sql) { return execute(prepare_request(sql)); }
+Json Transport::request(std::string_view op, Json body, bool& dispatched)
+{
+    return execute(request_operation(op, std::move(body), dispatched));
+}
 
 asio::awaitable<void> Transport::shutdown()
 {
