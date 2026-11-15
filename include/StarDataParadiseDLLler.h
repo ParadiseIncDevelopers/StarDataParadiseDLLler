@@ -92,6 +92,8 @@ SDP_API uint32_t SDP_CALL sdp_abi_version(void);
 // Open verifies the server certificate and completes hello, auth and capability discovery.
 SDP_API sdp_status SDP_CALL sdp_open(const sdp_open_options* options, sdp_connection* connection, sdp_error* error);
 SDP_API sdp_status SDP_CALL sdp_get_capabilities(sdp_connection connection, sdp_buffer* output, sdp_error* error);
+// Read the authenticated session identity and Server version from the negotiated hello reply.
+SDP_API sdp_status SDP_CALL sdp_get_session_info(sdp_connection connection, sdp_buffer* output, sdp_error* error);
 SDP_API sdp_status SDP_CALL sdp_health(sdp_connection connection, sdp_error* error);
 SDP_API sdp_status SDP_CALL sdp_prepare(sdp_connection connection, sdp_text sql, sdp_buffer* statement_id, sdp_error* error);
 

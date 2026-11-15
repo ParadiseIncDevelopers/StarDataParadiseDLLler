@@ -154,6 +154,7 @@
     <ClInclude Include="framework.h" />
     <ClInclude Include="transport.hpp" />
     <ClInclude Include="..\include\StarDataParadiseDLLler.h" />
+    <ClInclude Include="..\include\StarDataParadiseDLLler.hpp" />
     <ClInclude Include="pch.h" />
   </ItemGroup>
   <ItemGroup>

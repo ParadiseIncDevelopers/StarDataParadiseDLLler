@@ -44,6 +44,7 @@ public:
     void cancel(uint64_t operation);
     void close() noexcept;
     bool connected() const noexcept { return connected_.load(); }
+    wire::Json session_info() const;
 
 private:
     using Deadline = std::chrono::steady_clock::time_point;
@@ -91,5 +92,6 @@ private:
     std::atomic_bool connected_{false};
     uint32_t next_id_{1};
     std::string session_;
+    std::string server_version_;
 };
 }

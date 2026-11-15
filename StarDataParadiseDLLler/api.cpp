@@ -534,16 +534,24 @@ void job_submission(sdp_job_operation operation, const Json& request)
     const bool schedule = operation == SDP_JOB_SCHEDULE_CREATE;
     history_token(request, "request_token");
     const auto& kind = sdp::wire::string_field(request, "kind");
-    const bool backup = schedule && kind == "backup";
-    if (backup)
+    std::string_view task_field;
+    if (kind == "backup")
     {
-        if (request.contains("max_bytes")) job_unsigned(request, "max_bytes", 1, 536870912);
+        task_field = "max_bytes";
+        if (request.contains("max_bytes")) job_unsigned(request, "max_bytes", 1, 512 * 1024 * 1024);
     }
-    else
+    else if (kind == "maintenance")
     {
-        if (kind != "compute") throw Error(Code::invalid_argument);
+        task_field = "action";
+        const auto& action = sdp::wire::string_field(request, "action");
+        if (action != "integrity" && action != "statistics" && action != "index") throw Error(Code::invalid_argument);
+    }
+    else if (kind == "compute")
+    {
+        task_field = "count";
         job_unsigned(request, "count", 1, 1'000'000'000);
     }
+    else throw Error(Code::invalid_argument);
     if (schedule)
     {
         const auto& rule = sdp::wire::object_field(request, "rule");
@@ -554,11 +562,11 @@ void job_submission(sdp_job_operation operation, const Json& request)
     {
         const auto& key = field.key();
         if (key == "request_token" || key == "kind" || (schedule && key == "rule") ||
-            (backup ? key == "max_bytes" : key == "count"))
+            key == task_field)
             continue;
-        if (!backup && key == "timeout_ms") job_unsigned(request, "timeout_ms", 100, 60'000);
-        else if (!backup && key == "memory_mib") job_unsigned(request, "memory_mib", 16, 512);
-        else if (!backup && key == "output_bytes") job_unsigned(request, "output_bytes", 1, 65'536);
+        if (kind == "compute" && key == "timeout_ms") job_unsigned(request, "timeout_ms", 100, 60'000);
+        else if (kind == "compute" && key == "memory_mib") job_unsigned(request, "memory_mib", 16, 512);
+        else if (kind == "compute" && key == "output_bytes") job_unsigned(request, "output_bytes", 1, 65'536);
         else if (schedule && key == "retries") job_unsigned(request, "retries", 0, 3);
         else if (schedule && key == "backoff_seconds") job_unsigned(request, "backoff_seconds", 1, 3600);
         else if (schedule && key == "misfire") job_misfire(request);
@@ -1305,6 +1313,13 @@ public:
         write_buffer(output, capabilities_);
     }
 
+    void session_info(sdp_buffer& output)
+    {
+        std::lock_guard lock(mutex_);
+        ensure_open();
+        write_json(output, transport_.session_info());
+    }
+
     void health()
     {
         run([this] { transport_.health(); });
@@ -1581,6 +1596,14 @@ sdp_status SDP_CALL sdp_get_capabilities(sdp_connection connection, sdp_buffer* 
     return boundary(error, [&] {
         if (!output || output->data || output->size) throw Error(Code::invalid_argument);
         require_connection(connection)->capabilities(*output);
+    });
+}
+
+sdp_status SDP_CALL sdp_get_session_info(sdp_connection connection, sdp_buffer* output, sdp_error* error)
+{
+    return boundary(error, [&] {
+        check_output(output);
+        require_connection(connection)->session_info(*output);
     });
 }
 

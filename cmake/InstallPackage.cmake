@@ -14,7 +14,8 @@ endif()
 install(TARGETS StarDataParadiseDLLler EXPORT StarDataParadiseDLLlerTargets
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
-install(FILES include/StarDataParadiseDLLler.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES include/StarDataParadiseDLLler.h include/StarDataParadiseDLLler.hpp
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 set(package_directory "${CMAKE_INSTALL_LIBDIR}/cmake/StarDataParadiseDLLler")
 install(EXPORT StarDataParadiseDLLlerTargets NAMESPACE StarDataParadise::
     DESTINATION "${package_directory}")
@@ -27,8 +28,10 @@ install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/StarDataParadiseDLLlerConfig.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/StarDataParadiseDLLlerConfigVersion.cmake"
     DESTINATION "${package_directory}")
-install(FILES ABI.md contracts/README.md contracts/sdp-contract-v1.zip
+install(FILES ABI.md COMPATIBILITY.md BUILD.md contracts/README.md contracts/sdp-contract-v1.zip
     DESTINATION "${CMAKE_INSTALL_DATADIR}/StarDataParadiseDLLler")
+install(FILES examples/cpp/CMakeLists.txt examples/cpp/main.cpp
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/StarDataParadiseDLLler/examples/cpp")
 install(FILES licenses/OpenSSL.txt
     DESTINATION "${CMAKE_INSTALL_DATADIR}/StarDataParadiseDLLler/licenses")
 install(FILES "${asio_root}/LICENSE_1_0.txt"

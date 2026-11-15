@@ -34,7 +34,9 @@ def build_consumer(args, root):
     with zipfile.ZipFile(args.package) as package:
         package.extractall(sdk)
     for path in ("bin/StarDataParadiseDLLler.dll", "lib/StarDataParadiseDLLler.lib",
-                 "include/StarDataParadiseDLLler.h",
+                 "include/StarDataParadiseDLLler.h", "include/StarDataParadiseDLLler.hpp",
+                 "share/StarDataParadiseDLLler/COMPATIBILITY.md",
+                 "share/StarDataParadiseDLLler/examples/cpp/CMakeLists.txt",
                  "lib/cmake/StarDataParadiseDLLler/StarDataParadiseDLLlerConfig.cmake"):
         require((sdk / path).is_file(), f"package missing {path}")
     source = Path(__file__).resolve().with_name("consumer")
@@ -44,7 +46,13 @@ def build_consumer(args, root):
          "-A", "x64,version=10.0.26100.0", "-T", "v145,host=x64", f"-DCMAKE_PREFIX_PATH={sdk}", *flags],
         timeout=100)
     run([args.cmake, "--build", str(build), "--config", "Release"], timeout=100)
-    return str(build / "Release" / "sdp_native_consumer.exe")
+    example = root / "example"
+    run([args.cmake, "-S", str(sdk / "share/StarDataParadiseDLLler/examples/cpp"), "-B", str(example),
+         "-G", "Visual Studio 18 2026", "-A", "x64,version=10.0.26100.0", "-T", "v145,host=x64",
+         f"-DCMAKE_PREFIX_PATH={sdk}"], timeout=100)
+    run([args.cmake, "--build", str(example), "--config", "Release"], timeout=100)
+    return (str(build / "Release" / "sdp_native_consumer.exe"),
+            str(example / "Release" / "native_example.exe"))
 
 
 def certificates(openssl, root):
@@ -616,6 +624,9 @@ def test_backup_consumer(args, consumer, root, password):
             occurrence["state"] == "succeeded" and occurrence["result"]["verified"] and
             occurrence["result"]["backup_id"] != backup_id,
             "Native backup schedule failed to publish a distinct verified archive")
+    generic = seen["backup_generic_result"][0]
+    require(generic["state"] == "succeeded" and generic["result"]["verified"] and
+            generic["result"]["backup_id"] != backup_id, "Native generic job API refused backup")
     target = fixture / "temp" / "restores" / restored["target_name"]
     require((target / "store.sdp").is_file() and not (target / "admin-v1.json").exists() and
             not (target / "server.key").exists(),
@@ -662,6 +673,11 @@ def test_admin_consumer(args, consumer, root, password):
     require(queued["state"] == "queued" and queued["job_id"] == done["job_id"] and
             done["state"] == "succeeded" and done["result"] is not None,
             "Native maintenance submission did not complete through the shared job API")
+    generic = seen["admin_generic_maintenance"][0]
+    scheduled = seen["admin_scheduled_maintenance"][0]
+    require(generic["state"] == scheduled["state"] == "succeeded" and
+            generic["result"]["action"] == "integrity" and scheduled["result"]["action"] == "index",
+            "Native job API refused direct or scheduled maintenance")
     print("native_admin_status_health_config_support_and_maintenance passed", flush=True)
 
 def main():
@@ -689,7 +705,7 @@ def main():
     args.scratch.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="native-", dir=args.scratch.resolve()) as folder:
         root = Path(folder)
-        consumer = build_consumer(args, root)
+        consumer, example = build_consumer(args, root)
         print("independent installed-package build passed", flush=True)
         certificates(args.openssl, root)
         password = secrets.token_urlsafe(32)
@@ -698,6 +714,11 @@ def main():
 
         with server_instance(args.server, root, password) as server_port:
             run_client(consumer, "real", server_port, ca, password)
+            metadata, capabilities = map(json.loads, run([example, "127.0.0.1", str(server_port), "localhost",
+                str(ca), "local-admin"], input=password + "\n", timeout=15).splitlines())
+            require(len(metadata["session_id"]) == 32 and metadata["protocol_version"] == 1 and
+                    metadata["product_version"] and capabilities["health"], "installed C++ example failed")
+            print("installed_cxx_example_hello_and_capabilities passed", flush=True)
             run_client(consumer, "callback_close", server_port, ca, password)
             run_client(consumer, "invalid_abi", server_port, ca, password)
             run_client(consumer, "auth_reject", server_port, ca, incorrect)
@@ -706,6 +727,14 @@ def main():
             run_client(consumer, "tls_untrusted", server_port, root / "other.pem", password)
             for mode in ("operation_timeout", "cancel", "connection_loss"):
                 test_fault(consumer, mode, server_port, ca, password)
+            run_client(consumer, "real", server_port, ca, password)
+            print("explicit_read_after_reconnect passed", flush=True)
+
+        raii = root / "raii"
+        raii.mkdir()
+        certificates(args.openssl, raii)
+        with server_instance(args.server, raii, password, initialize=True) as port:
+            run_client(consumer, "raii", port, raii / "ca.pem", password)
 
         with local_listener() as listener:
             begin = time.monotonic()

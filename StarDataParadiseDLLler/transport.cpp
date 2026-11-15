@@ -223,12 +223,12 @@ asio::awaitable<std::string> Transport::connect(const Endpoint& endpoint, std::s
     check(error, true);
 
     const auto hello = co_await exchange(wire::request(next_id_++, "hello",
-        Json{{"client", "StarDataParadiseDLLler/0.3.0"}}), deadline);
+        Json{{"client", "StarDataParadiseDLLler/0.4.0"}}), deadline);
     session_ = wire::string_field(hello, "session_id");
     const auto protocol = hello.find("protocol_version");
     if (!hex_id(session_) || protocol == hello.end() || !protocol->is_number_integer() || *protocol != wire::version)
         throw Error(Code::incompatible);
-    wire::string_field(hello, "product_version");
+    server_version_ = wire::string_field(hello, "product_version");
 
     auto auth_request = wire::request(next_id_++, "auth");
     const ClearWireRequest scrub{auth_request};
@@ -290,6 +290,11 @@ asio::awaitable<Json> Transport::exchange_packet(Json& packet, Deadline deadline
         co_return std::move(response.at("body"));
     }
     catch (const Json::exception&) { throw Error(Code::malformed); }
+}
+
+Json Transport::session_info() const
+{
+    return {{"session_id", session_}, {"product_version", server_version_}, {"protocol_version", wire::version}};
 }
 
 asio::awaitable<void> Transport::health_request()

@@ -1,10 +1,12 @@
-#include <StarDataParadiseDLLler.h>
+#include <StarDataParadiseDLLler.hpp>
 #include <windows.h>
 
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <future>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1124,6 +1126,11 @@ void backup_roundtrip(sdp_connection connection)
     std::cout << "backup_deleted " << backup(connection, SDP_BACKUP_DELETE, archive_selector) << '\n';
     std::cout << "backup_final_catalog " << backup(connection, SDP_BACKUP_CATALOG) << '\n';
 
+    const auto generic = job(actor, connection, SDP_JOB_SUBMIT,
+        R"({"kind":"backup","max_bytes":67108864,"request_token":"00000000000000000000000000000285"})");
+    const auto generic_id = job_selector("job_id", json_id(generic, "job_id"));
+    std::cout << "backup_generic_result " << await_job(actor, connection, generic_id, "succeeded") << '\n';
+
     const auto scheduled = job(actor, connection, SDP_JOB_SCHEDULE_CREATE,
         R"({"kind":"backup","rule":{"every_seconds":2},"max_bytes":67108864,"request_token":"00000000000000000000000000000284"})");
     const auto schedule = job_selector("schedule_id", json_id(scheduled, "schedule_id"));
@@ -1190,6 +1197,30 @@ void admin_roundtrip(sdp_connection connection)
     std::cout << "admin_maintenance_queued " << queued << '\n';
     const auto job_id = job_selector("job_id", json_id(queued, "job_id"));
     std::cout << "admin_maintenance_done " << await_job(actor, connection, job_id, "succeeded") << '\n';
+
+    const auto generic = job(actor, connection, SDP_JOB_SUBMIT,
+        R"({"kind":"maintenance","action":"integrity","request_token":"00000000000000000000000000000304"})");
+    const auto generic_id = job_selector("job_id", json_id(generic, "job_id"));
+    std::cout << "admin_generic_maintenance " << await_job(actor, connection, generic_id, "succeeded") << '\n';
+
+    const auto scheduled = job(actor, connection, SDP_JOB_SCHEDULE_CREATE,
+        R"({"kind":"maintenance","action":"index","rule":{"every_seconds":1},"request_token":"00000000000000000000000000000305"})");
+    const auto schedule = job_selector("schedule_id", json_id(scheduled, "schedule_id"));
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        const auto status = job(actor, connection, SDP_JOB_SCHEDULE_STATUS, schedule);
+        if (status.find("\"last_job_id\":\"") != status.npos)
+        {
+            const auto scheduled_job = job_selector("job_id", json_id(status, "last_job_id"));
+            (void)job(actor, connection, SDP_JOB_SCHEDULE_CANCEL, schedule);
+            std::cout << "admin_scheduled_maintenance " << await_job(actor, connection, scheduled_job, "succeeded")
+                << '\n';
+            return;
+        }
+        Sleep(30);
+    }
+    throw std::runtime_error("Native maintenance schedule did not dispatch a job");
 }
 
 void job_roundtrip(Handle& submitter, sdp_open_options& options)
@@ -1299,11 +1330,79 @@ void job_roundtrip(Handle& submitter, sdp_open_options& options)
     std::cout << "job_schedule_cancelled " << job(observer, resumed.value, SDP_JOB_SCHEDULE_CANCEL, schedule_selector) << '\n';
 }
 
+void raii_roundtrip(const sdp_open_options& options)
+{
+    using sdp::client::Connection;
+    using sdp::client::Statement;
+    using sdp::client::Transaction;
+
+    Connection initial(options);
+    auto info = initial.session_info();
+    const auto expected = json_id(info.view(), "session_id");
+    auto moved = std::move(info);
+    require(info.view().empty() && json_id(moved.view(), "session_id") == expected &&
+        moved.view().find("\"protocol_version\":1") != moved.view().npos, "Moved metadata buffer lost ownership");
+
+    Connection active(options);
+    const auto closed = active.native_handle();
+    active = std::move(initial);
+    require(initial.native_handle() == 0 && json_id(active.session_info().view(), "session_id") == expected,
+        "Moving a connection changed its authenticated identity");
+    sdp::client::Buffer response;
+    sdp_error error{};
+    const auto stale = sdp_get_session_info(closed, response.put(), &error);
+    expect(stale, SDP_INVALID_STATE, error);
+
+    {
+        Statement create(active, "CREATE TABLE raii_rows (id BIGINT PRIMARY KEY)");
+        (void)create.execute({}, "00000000000000000000000000000311");
+    }
+    {
+        Transaction transaction(active);
+        Statement insert(active, "INSERT INTO raii_rows VALUES (:id)", R"({"id":{"type":"BIGINT"}})");
+        Statement moved_insert(std::move(insert));
+        require(insert.id().empty(), "Moved statement did not clear the original owner");
+        (void)moved_insert.execute(R"({"id":{"t":"i64","v":"1"}})");
+    }
+    {
+        Statement select(active, "SELECT id FROM raii_rows");
+        const auto result = json_id(select.execute().view());
+        const auto fetch = sdp_fetch(active.native_handle(), text(result), 4, response.put(), &error);
+        expect(fetch, SDP_OK, error);
+        require(response.view().find("\"rows\":[]") != response.view().npos, "Scope rollback failed");
+        const std::string retired(select.id());
+        select.close();
+        const auto expired = sdp_statement_close(active.native_handle(), text(retired), &error);
+        expect(expired, SDP_INVALID_STATE, error);
+    }
+    {
+        Transaction transaction(active);
+        Statement insert(active, "INSERT INTO raii_rows VALUES (2)");
+        (void)insert.execute();
+        constexpr auto token = "00000000000000000000000000000312"sv;
+        const auto committed = transaction.commit(token);
+        require(!transaction.active() && active.outcome(token).view() == committed.view(),
+            "Transaction did not preserve the commit receipt");
+    }
+
+    std::array<std::future<std::string>, 4> connections;
+    for (auto& connection : connections)
+    {
+        connection = std::async(std::launch::async, [&] {
+            Connection worker(options);
+            worker.health();
+            return json_id(worker.session_info().view(), "session_id");
+        });
+    }
+    std::set<std::string> ids{expected};
+    for (auto& connection : connections) require(ids.insert(connection.get()).second, "Parallel sessions share an ID");
+}
+
 int use_package(int argc, char** argv)
 {
     require(argc == 4, "Usage: sdp_native_consumer mode port ca-file");
     const std::string_view mode(argv[1]);
-    require(sdp_abi_version() == SDP_ABI_VERSION && sdp_library_version() == 0x00000300u,
+    require(sdp_abi_version() == SDP_ABI_VERSION && sdp_library_version() == 0x00000400u,
         "library or ABI version mismatch");
 
     Password password;
@@ -1321,6 +1420,12 @@ int use_package(int argc, char** argv)
     options.password = text(password.value);
     options.port = port_from(argv[2]);
     options.timeout_ms = mode == "handshake_timeout" ? 900 : (mode == "debugger" || mode == "jobs" || mode == "backup" || mode == "admin") ? 12000 : 3500;
+
+    if (mode == "raii")
+    {
+        raii_roundtrip(options);
+        return 0;
+    }
 
     Handle connection;
     sdp_error error{};

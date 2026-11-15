@@ -115,7 +115,7 @@ SUPPORT_CREATE, 1–32 küçük ASCII harf, rakam, çizgi veya alt çizgiden olu
 Paketin SHA-256 değerini kontrol ettikten sonra ZIP'i aç ve kurulum dizinini `CMAKE_PREFIX_PATH` ile ver.
 
 ```cmake
-find_package(StarDataParadiseDLLler 0.3.0 EXACT CONFIG REQUIRED)
+find_package(StarDataParadiseDLLler 0.4.0 EXACT CONFIG REQUIRED)
 target_link_libraries(my_client PRIVATE StarDataParadise::StarDataParadiseDLLler)
 ```
 
