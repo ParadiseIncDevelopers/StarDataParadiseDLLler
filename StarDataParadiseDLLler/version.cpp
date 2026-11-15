@@ -2,5 +2,5 @@
 
 uint32_t SDP_CALL sdp_library_version(void)
 {
-    return 0x00000200u;
+    return 0x00000300u;
 }

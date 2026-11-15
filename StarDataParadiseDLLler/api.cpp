@@ -1,6 +1,7 @@
 #include "transport.hpp"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <condition_variable>
 #include <cstring>
@@ -344,6 +345,809 @@ Json history_request(sdp_text input)
         return request;
     }
     catch (const Error&) { throw Error(Code::invalid_argument); }
+}
+
+std::string_view decision_operation_name(sdp_decision_operation operation)
+{
+    switch (operation)
+    {
+    case SDP_DECISION_CREATE: return "decision_create";
+    case SDP_DECISION_VALIDATE: return "decision_validate";
+    case SDP_DECISION_ACTIVATE: return "decision_activate";
+    case SDP_DECISION_TEST: return "decision_test";
+    case SDP_DECISION_EXPLAIN: return "decision_explain";
+    case SDP_DECISION_WHYNOT: return "decision_whynot";
+    case SDP_DECISION_WHATIF: return "decision_whatif";
+    case SDP_DECISION_RECHECK: return "decision_recheck";
+    default: throw Error(Code::invalid_argument);
+    }
+}
+
+void decision_text(const Json& request, const char* key, size_t limit)
+{
+    const auto& value = sdp::wire::string_field(request, key);
+    if (value.empty() || value.size() > limit || value.find('\0') != value.npos)
+        throw Error(Code::invalid_argument);
+}
+
+void decision_scenario(const Json& request, bool standalone)
+{
+    if (!request.is_object()) throw Error(Code::invalid_argument);
+    if (standalone)
+    {
+        decision_text(request, "target", 512);
+        if (request.contains("revision")) positive_history_id(request, "revision");
+    }
+    for (auto field = request.cbegin(); field != request.cend(); ++field)
+        if (field.key() != "event" && field.key() != "row_id" && field.key() != "proposed" &&
+            !(standalone && (field.key() == "target" || field.key() == "revision")))
+            throw Error(Code::invalid_argument);
+    const auto& event = sdp::wire::string_field(request, "event");
+    if (event != "insert" && event != "update" && event != "delete")
+        throw Error(Code::invalid_argument);
+    if (request.contains("row_id")) positive_history_id(request, "row_id");
+    if (request.contains("proposed"))
+    {
+        const auto& proposed = sdp::wire::object_field(request, "proposed");
+        if (proposed.size() > 128) throw Error(Code::invalid_argument);
+        size_t nodes{};
+        for (auto field = proposed.cbegin(); field != proposed.cend(); ++field)
+        {
+            if (field.key().empty() || field.key().size() > 128 || field.key().find('\0') != std::string::npos)
+                throw Error(Code::invalid_argument);
+            validate_cell(*field, 0, nodes);
+        }
+    }
+}
+
+Json decision_request(sdp_decision_operation operation, sdp_text input)
+{
+    try
+    {
+        auto request = sdp::wire::parse_payload(checked_text(input, 64 * 1024));
+        if (operation == SDP_DECISION_CREATE || operation == SDP_DECISION_ACTIVATE || operation == SDP_DECISION_VALIDATE)
+        {
+            if (operation == SDP_DECISION_VALIDATE) exact_fields(request, {"sql"});
+            else
+            {
+                exact_fields(request, {"sql", "request_token"});
+                history_token(request, "request_token");
+            }
+            decision_text(request, "sql", 32 * 1024);
+        }
+        else if (operation == SDP_DECISION_TEST)
+        {
+            if (request.contains("revision"))
+            {
+                exact_fields(request, {"target", "rule", "from_version", "to_version", "cases", "revision"});
+                positive_history_id(request, "revision");
+            }
+            else exact_fields(request, {"target", "rule", "from_version", "to_version", "cases"});
+            decision_text(request, "target", 512);
+            decision_text(request, "rule", 512);
+            for (const auto key : {"from_version", "to_version"})
+            {
+                const auto& version = response_field(request, key, Json::value_t::number_unsigned);
+                if (version == 0 || version > UINT32_MAX) throw Error(Code::invalid_argument);
+            }
+            const auto& cases = response_field(request, "cases", Json::value_t::array);
+            if (cases.empty() || cases.size() > 16) throw Error(Code::invalid_argument);
+            for (const auto& item : cases) decision_scenario(item, false);
+        }
+        else decision_scenario(request, true);
+        return request;
+    }
+    catch (const Error&) { throw Error(Code::invalid_argument); }
+}
+
+void check_decision_result(const Json& response)
+{
+    positive_history_id(response, "revision");
+    response_field(response, "allowed", Json::value_t::boolean);
+    sdp::wire::string_field(response, "reason");
+    response_field(response, "rules", Json::value_t::array);
+    const auto& computed = sdp::wire::object_field(response, "computed");
+    if (computed.size() > 128) throw Error(Code::malformed);
+    size_t nodes{};
+    for (const auto& value : computed) validate_cell(value, 0, nodes);
+}
+
+void check_decision_response(sdp_decision_operation operation, const Json& response)
+{
+    switch (operation)
+    {
+    case SDP_DECISION_CREATE:
+    case SDP_DECISION_ACTIVATE:
+        response_field(response, "affected_rows", Json::value_t::number_unsigned);
+        positive_history_id(response, "lsn");
+        break;
+    case SDP_DECISION_VALIDATE:
+        if (response_field(response, "valid", Json::value_t::boolean) != true) throw Error(Code::malformed);
+        break;
+    case SDP_DECISION_TEST:
+    {
+        positive_history_id(response, "revision");
+        const auto& changed = response_field(response, "changed", Json::value_t::number_unsigned);
+        const auto& cases = response_field(response, "cases", Json::value_t::array);
+        if (cases.empty() || cases.size() > 16 || changed > cases.size()) throw Error(Code::malformed);
+        for (const auto& item : cases)
+        {
+            check_decision_result(sdp::wire::object_field(item, "prior"));
+            check_decision_result(sdp::wire::object_field(item, "candidate"));
+        }
+        break;
+    }
+    default:
+        check_decision_result(response);
+        break;
+    }
+}
+
+std::string_view job_operation_name(sdp_job_operation operation)
+{
+    switch (operation)
+    {
+    case SDP_JOB_SUBMIT: return "job_submit";
+    case SDP_JOB_STATUS: return "job_status";
+    case SDP_JOB_WATCH: return "job_watch";
+    case SDP_JOB_CANCEL: return "job_cancel";
+    case SDP_JOB_SCHEDULE_CREATE: return "job_schedule_create";
+    case SDP_JOB_SCHEDULE_STATUS: return "job_schedule_status";
+    case SDP_JOB_SCHEDULE_CANCEL: return "job_schedule_cancel";
+    case SDP_JOB_CAPABILITIES: return "job_capabilities";
+    default: throw Error(Code::invalid_argument);
+    }
+}
+
+void job_unsigned(const Json& object, const char* key, uint64_t minimum, uint64_t maximum = UINT64_MAX)
+{
+    const auto& value = response_field(object, key, Json::value_t::number_unsigned);
+    if (value < minimum || value > maximum) throw Error(Code::invalid_argument);
+}
+
+void job_misfire(const Json& object)
+{
+    const auto& value = sdp::wire::string_field(object, "misfire");
+    if (value != "skip" && value != "run_once") throw Error(Code::invalid_argument);
+}
+
+void schedule_rule(const Json& rule)
+{
+    const auto extra = rule.contains("misfire") ? 1u : 0u;
+    if (extra) job_misfire(rule);
+    if (rule.contains("every_seconds"))
+    {
+        if (rule.size() != 1 + extra) throw Error(Code::invalid_argument);
+        job_unsigned(rule, "every_seconds", 1, 31'536'000);
+    }
+    else
+    {
+        if (rule.size() != 3 + extra) throw Error(Code::invalid_argument);
+        decision_text(rule, "timezone", 128);
+        job_unsigned(rule, "hour", 0, 23);
+        job_unsigned(rule, "minute", 0, 59);
+    }
+}
+
+void job_submission(sdp_job_operation operation, const Json& request)
+{
+    const bool schedule = operation == SDP_JOB_SCHEDULE_CREATE;
+    history_token(request, "request_token");
+    const auto& kind = sdp::wire::string_field(request, "kind");
+    const bool backup = schedule && kind == "backup";
+    if (backup)
+    {
+        if (request.contains("max_bytes")) job_unsigned(request, "max_bytes", 1, 536870912);
+    }
+    else
+    {
+        if (kind != "compute") throw Error(Code::invalid_argument);
+        job_unsigned(request, "count", 1, 1'000'000'000);
+    }
+    if (schedule)
+    {
+        const auto& rule = sdp::wire::object_field(request, "rule");
+        if (rule.contains("misfire") && request.contains("misfire")) throw Error(Code::invalid_argument);
+        schedule_rule(rule);
+    }
+    for (auto field = request.cbegin(); field != request.cend(); ++field)
+    {
+        const auto& key = field.key();
+        if (key == "request_token" || key == "kind" || (schedule && key == "rule") ||
+            (backup ? key == "max_bytes" : key == "count"))
+            continue;
+        if (!backup && key == "timeout_ms") job_unsigned(request, "timeout_ms", 100, 60'000);
+        else if (!backup && key == "memory_mib") job_unsigned(request, "memory_mib", 16, 512);
+        else if (!backup && key == "output_bytes") job_unsigned(request, "output_bytes", 1, 65'536);
+        else if (schedule && key == "retries") job_unsigned(request, "retries", 0, 3);
+        else if (schedule && key == "backoff_seconds") job_unsigned(request, "backoff_seconds", 1, 3600);
+        else if (schedule && key == "misfire") job_misfire(request);
+        else throw Error(Code::invalid_argument);
+    }
+}
+
+Json job_request(sdp_job_operation operation, sdp_text input)
+{
+    try
+    {
+        auto request = input.size ? sdp::wire::parse_payload(checked_text(input, 64 * 1024)) : Json::object();
+        switch (operation)
+        {
+        case SDP_JOB_SUBMIT:
+        case SDP_JOB_SCHEDULE_CREATE:
+            job_submission(operation, request);
+            break;
+        case SDP_JOB_SCHEDULE_STATUS:
+        case SDP_JOB_SCHEDULE_CANCEL:
+            exact_fields(request, {"schedule_id"});
+            history_token(request, "schedule_id");
+            break;
+        case SDP_JOB_STATUS:
+        case SDP_JOB_WATCH:
+        case SDP_JOB_CANCEL:
+            exact_fields(request, {"job_id"});
+            history_token(request, "job_id");
+            break;
+        case SDP_JOB_CAPABILITIES:
+            exact_fields(request, {});
+            break;
+        }
+        return request;
+    }
+    catch (const Error&) { throw Error(Code::invalid_argument); }
+}
+
+void check_job_response(sdp_job_operation operation, const Json& response)
+{
+    switch (operation)
+    {
+    case SDP_JOB_SUBMIT:
+    case SDP_JOB_STATUS:
+    case SDP_JOB_WATCH:
+    case SDP_JOB_CANCEL:
+    {
+        history_token(response, "job_id");
+        const auto& state = sdp::wire::string_field(response, "state");
+        if (state.empty()) throw Error(Code::malformed);
+        response_field(response, "attempt", Json::value_t::number_unsigned);
+        response_field(response, "cancel_requested", Json::value_t::boolean);
+        response_field(response, "events", Json::value_t::array);
+        const auto progress = response.find("progress");
+        const auto result = response.find("result");
+        if (result == response.end() || (!result->is_null() && !result->is_object()) || progress == response.end())
+            throw Error(Code::malformed);
+        if (!progress->is_null())
+        {
+            if (!progress->is_object()) throw Error(Code::malformed);
+            const auto& done = response_field(*progress, "done", Json::value_t::number_unsigned);
+            const auto& total = response_field(*progress, "total", Json::value_t::number_unsigned);
+            if (total == 0 || done > total) throw Error(Code::malformed);
+        }
+        if (response.contains("lsn")) positive_history_id(response, "lsn");
+        break;
+    }
+    case SDP_JOB_SCHEDULE_CREATE:
+    case SDP_JOB_SCHEDULE_STATUS:
+    case SDP_JOB_SCHEDULE_CANCEL:
+        history_token(response, "schedule_id");
+        response_field(response, "enabled", Json::value_t::boolean);
+        if (response.contains("lsn")) positive_history_id(response, "lsn");
+        break;
+    }
+}
+
+struct WireCommand
+{
+    std::string_view name;
+    bool writes;
+};
+
+constexpr std::array dataset_commands{
+    WireCommand{"dataset_create", true},
+    WireCommand{"dataset_get", false},
+    WireCommand{"dataset_delete", true},
+    WireCommand{"dataset_plsql_submit", true}};
+constexpr std::array model_commands{
+    WireCommand{"model_create", true},
+    WireCommand{"model_status", false},
+    WireCommand{"model_train", true},
+    WireCommand{"model_evaluate", false},
+    WireCommand{"model_predict", false},
+    WireCommand{"model_activate", true},
+    WireCommand{"model_compare", false},
+    WireCommand{"model_checkpoint", false},
+    WireCommand{"model_resume", true},
+    WireCommand{"model_deactivate", true},
+    WireCommand{"model_rollback", true},
+    WireCommand{"model_delete", true},
+    WireCommand{"model_devices", false}};
+static_assert(dataset_commands.size() == SDP_DATASET_PLSQL_SUBMIT);
+static_assert(model_commands.size() == SDP_MODEL_DEVICES);
+
+template<size_t Count>
+const WireCommand& wire_command_spec(uint32_t operation, const std::array<WireCommand, Count>& commands)
+{
+    if (!operation || operation > commands.size()) throw Error(Code::invalid_argument);
+    return commands[operation - 1];
+}
+
+void only_fields(const Json& request, std::initializer_list<std::string_view> allowed)
+{
+    for (const auto& item : request.items())
+        if (std::ranges::find(allowed, item.key()) == allowed.end()) throw Error(Code::invalid_argument);
+}
+
+Json dataset_request(sdp_dataset_operation operation, sdp_text input)
+{
+    try
+    {
+        auto request = input.size ? sdp::wire::parse_payload(checked_text(input, 64 * 1024)) : Json::object();
+        switch (operation)
+        {
+        case SDP_DATASET_CREATE:
+            only_fields(request, {"request_token", "sql", "options", "parameter_types", "parameters"});
+            history_token(request, "request_token");
+            decision_text(request, "sql", 64 * 1024);
+            (void)sdp::wire::object_field(request, "options");
+            for (const auto key : {"parameter_types", "parameters"})
+                if (request.contains(key)) (void)sdp::wire::object_field(request, key);
+            break;
+        case SDP_DATASET_GET:
+        case SDP_DATASET_DELETE:
+            exact_fields(request, {"dataset_id"});
+            history_token(request, "dataset_id");
+            break;
+        case SDP_DATASET_PLSQL_SUBMIT:
+        {
+            exact_fields(request, {"request_token", "dataset_id", "routine", "indices", "arguments"});
+            history_token(request, "request_token");
+            history_token(request, "dataset_id");
+            decision_text(request, "routine", 1024);
+            const auto& indices = response_field(request, "indices", Json::value_t::array);
+            if (indices.empty() || indices.size() > 64) throw Error(Code::invalid_argument);
+            for (const auto& index : indices)
+                if (!index.is_number_unsigned() || index.get<uint64_t>() >= 1024) throw Error(Code::invalid_argument);
+            const auto& arguments = sdp::wire::object_field(request, "arguments");
+            if (arguments.size() > 32) throw Error(Code::invalid_argument);
+            for (const auto& item : arguments.items())
+                if (!item.value().is_string()) throw Error(Code::invalid_argument);
+            break;
+        }
+        }
+        return request;
+    }
+    catch (const Error&) { throw Error(Code::invalid_argument); }
+}
+
+void model_comparison(const Json& body)
+{
+    exact_fields(body, {"runs", "split"});
+    const auto& split = sdp::wire::string_field(body, "split");
+    if (split != "train" && split != "validation" && split != "test") throw Error(Code::invalid_argument);
+    const auto& runs = response_field(body, "runs", Json::value_t::array);
+    if (runs.size() < 2 || runs.size() > 8) throw Error(Code::invalid_argument);
+    for (const auto& run : runs)
+    {
+        exact_fields(run, {"name", "version"});
+        decision_text(run, "name", 1024);
+        job_unsigned(run, "version", 1, UINT32_MAX);
+    }
+}
+
+void sha256_field(const Json& body, const char* key)
+{
+    const auto& checksum = sdp::wire::string_field(body, key);
+    if (checksum.size() != 64 || checksum.find_first_not_of("0123456789abcdef") != checksum.npos)
+        throw Error(Code::malformed);
+}
+
+void model_device_options(const Json& request)
+{
+    if (request.contains("device_index")) job_unsigned(request, "device_index", 0, 31);
+    if (request.contains("memory_mib")) job_unsigned(request, "memory_mib", 1, 131072);
+}
+
+void model_training_device(const Json& request)
+{
+    const auto device = request.contains("device") ?
+        std::string_view(sdp::wire::string_field(request, "device")) : "cpu";
+    if (device == "cpu")
+    {
+        if (request.contains("device_index") || request.contains("memory_mib") || request.contains("allow_cpu_fallback"))
+            throw Error(Code::invalid_argument);
+        return;
+    }
+    if (device != "gpu") throw Error(Code::invalid_argument);
+    model_device_options(request);
+    if (request.contains("allow_cpu_fallback"))
+        response_field(request, "allow_cpu_fallback", Json::value_t::boolean);
+}
+
+Json model_request(sdp_model_operation operation, sdp_text input)
+{
+    try
+    {
+        auto request = input.size ? sdp::wire::parse_payload(checked_text(input, 64 * 1024)) : Json::object();
+        if (operation == SDP_MODEL_COMPARE)
+        {
+            model_comparison(request);
+            return request;
+        }
+        if (operation == SDP_MODEL_DEVICES)
+        {
+            only_fields(request, {"device_index", "memory_mib"});
+            model_device_options(request);
+            return request;
+        }
+        decision_text(request, "name", 1024);
+        switch (operation)
+        {
+        case SDP_MODEL_CREATE:
+            exact_fields(request, {"name", "algorithm", "request_token"});
+            decision_text(request, "algorithm", 32);
+            history_token(request, "request_token");
+            break;
+        case SDP_MODEL_STATUS:
+            exact_fields(request, {"name"});
+            break;
+        case SDP_MODEL_TRAIN:
+            only_fields(request, {"name", "dataset_id", "request_token", "seed", "options",
+                "pause_after_epoch", "device", "device_index", "memory_mib", "allow_cpu_fallback"});
+            history_token(request, "dataset_id");
+            history_token(request, "request_token");
+            if (request.contains("seed")) job_unsigned(request, "seed", 0);
+            if (request.contains("options")) (void)sdp::wire::object_field(request, "options");
+            if (request.contains("pause_after_epoch")) job_unsigned(request, "pause_after_epoch", 1, 1000);
+            model_training_device(request);
+            break;
+        case SDP_MODEL_EVALUATE:
+            only_fields(request, {"name", "version"});
+            if (request.contains("version")) job_unsigned(request, "version", 1, UINT32_MAX);
+            break;
+        case SDP_MODEL_PREDICT:
+            exact_fields(request, {"name", "features"});
+            (void)sdp::wire::object_field(request, "features");
+            break;
+        case SDP_MODEL_ACTIVATE:
+        case SDP_MODEL_ROLLBACK:
+        case SDP_MODEL_DELETE:
+            exact_fields(request, {"name", "version", "request_token"});
+            job_unsigned(request, "version", 1, UINT32_MAX);
+            history_token(request, "request_token");
+            break;
+        case SDP_MODEL_CHECKPOINT:
+            exact_fields(request, {"name", "job_id"});
+            history_token(request, "job_id");
+            break;
+        case SDP_MODEL_RESUME:
+            exact_fields(request, {"name", "job_id", "checksum", "request_token"});
+            history_token(request, "job_id");
+            sha256_field(request, "checksum");
+            history_token(request, "request_token");
+            break;
+        case SDP_MODEL_DEACTIVATE:
+            exact_fields(request, {"name", "request_token"});
+            history_token(request, "request_token");
+            break;
+        }
+        return request;
+    }
+    catch (const Error&) { throw Error(Code::invalid_argument); }
+}
+
+void check_dataset_response(sdp_dataset_operation operation, const Json& response)
+{
+    if (operation == SDP_DATASET_PLSQL_SUBMIT)
+    {
+        check_job_response(SDP_JOB_SUBMIT, response);
+        return;
+    }
+    if (operation == SDP_DATASET_DELETE)
+    {
+        if (!response_field(response, "deleted", Json::value_t::boolean).get<bool>())
+            throw Error(Code::malformed);
+        positive_history_id(response, "lsn");
+        return;
+    }
+    history_token(response, "dataset_id");
+    decision_text(response, "owner", 128);
+    positive_history_id(response, "revision");
+    response_field(response, "row_count", Json::value_t::number_unsigned);
+    response_field(response, "byte_count", Json::value_t::number_unsigned);
+    if (operation == SDP_DATASET_GET)
+    {
+        (void)sdp::wire::object_field(response, "source");
+        (void)sdp::wire::object_field(response, "prepared");
+    }
+    if (response.contains("lsn")) positive_history_id(response, "lsn");
+}
+
+void check_model_response(sdp_model_operation operation, const Json& response)
+{
+    switch (operation)
+    {
+    case SDP_MODEL_CREATE:
+    case SDP_MODEL_STATUS:
+        decision_text(response, "name", 1024);
+        positive_history_id(response, "object_id");
+        decision_text(response, "algorithm", 32);
+        response_field(response, "versions", Json::value_t::array);
+        if (!response.contains("active_version") ||
+            !(response["active_version"].is_null() || response["active_version"].is_number_unsigned()))
+            throw Error(Code::malformed);
+        break;
+    case SDP_MODEL_TRAIN:
+    case SDP_MODEL_RESUME:
+        check_job_response(SDP_JOB_SUBMIT, response);
+        break;
+    case SDP_MODEL_EVALUATE:
+        response_field(response, "version", Json::value_t::number_unsigned);
+        (void)sdp::wire::object_field(response, "artifact");
+        (void)sdp::wire::object_field(response, "metrics");
+        break;
+    case SDP_MODEL_PREDICT:
+        response_field(response, "version", Json::value_t::number_unsigned);
+        if (!response.contains("prediction") ||
+            !(response["prediction"].is_number() || response["prediction"].is_array()))
+            throw Error(Code::malformed);
+        break;
+    case SDP_MODEL_ACTIVATE:
+    case SDP_MODEL_ROLLBACK:
+        response_field(response, "version", Json::value_t::number_unsigned);
+        response_field(response, "active_version", Json::value_t::number_unsigned);
+        positive_history_id(response, "lsn");
+        break;
+    case SDP_MODEL_DEACTIVATE:
+        response_field(response, "active_version", Json::value_t::null);
+        positive_history_id(response, "lsn");
+        break;
+    case SDP_MODEL_DELETE:
+        response_field(response, "version", Json::value_t::number_unsigned);
+        if (!response_field(response, "deleted", Json::value_t::boolean).get<bool>())
+            throw Error(Code::malformed);
+        positive_history_id(response, "lsn");
+        break;
+    case SDP_MODEL_CHECKPOINT:
+        history_token(response, "job_id");
+        history_token(response, "dataset_id");
+        sha256_field(response, "checksum");
+        response_field(response, "epoch", Json::value_t::number_unsigned);
+        break;
+    case SDP_MODEL_DEVICES:
+        response_field(response, "cpu_available", Json::value_t::boolean);
+        response_field(response, "gpu_available", Json::value_t::boolean);
+        response_field(response, "gpu_verified", Json::value_t::boolean);
+        response_field(response, "devices", Json::value_t::array);
+        response_field(response, "device_index", Json::value_t::number_unsigned);
+        response_field(response, "memory_mib", Json::value_t::number_unsigned);
+        if (!response.contains("driver_version") ||
+            !(response["driver_version"].is_null() || response["driver_version"].is_number_unsigned()))
+            throw Error(Code::malformed);
+        break;
+    case SDP_MODEL_COMPARE:
+        response_field(response, "comparable", Json::value_t::boolean);
+        response_field(response, "runs", Json::value_t::array);
+        break;
+    }
+    if (response.contains("lsn")) positive_history_id(response, "lsn");
+}
+
+constexpr std::array backup_commands{
+    WireCommand{"backup_submit", true},
+    WireCommand{"backup_status", false},
+    WireCommand{"backup_cancel", true},
+    WireCommand{"backup_catalog", false},
+    WireCommand{"backup_verify", true},
+    WireCommand{"backup_restore", true},
+    WireCommand{"backup_delete", true}};
+static_assert(backup_commands.size() == SDP_BACKUP_DELETE);
+
+void instance_target_name(const Json& body)
+{
+    decision_text(body, "target_name", 32);
+    const auto& name = sdp::wire::string_field(body, "target_name");
+    constexpr std::string_view label_characters = "abcdefghijklmnopqrstuvwxyz0123456789_-";
+    if (name.find_first_not_of(label_characters) != name.npos) throw Error(Code::invalid_argument);
+}
+
+Json backup_request(sdp_backup_operation operation, sdp_text input)
+{
+    try
+    {
+        auto request = input.size ? sdp::wire::parse_payload(checked_text(input, 64 * 1024)) : Json::object();
+        switch (operation)
+        {
+        case SDP_BACKUP_SUBMIT:
+            only_fields(request, {"request_token", "max_bytes"});
+            history_token(request, "request_token");
+            if (request.contains("max_bytes")) job_unsigned(request, "max_bytes", 1, 536870912);
+            break;
+        case SDP_BACKUP_STATUS:
+        case SDP_BACKUP_CANCEL:
+            exact_fields(request, {"job_id"});
+            history_token(request, "job_id");
+            break;
+        case SDP_BACKUP_CATALOG:
+            exact_fields(request, {});
+            break;
+        case SDP_BACKUP_VERIFY:
+        case SDP_BACKUP_DELETE:
+            exact_fields(request, {"backup_id"});
+            history_token(request, "backup_id");
+            break;
+        case SDP_BACKUP_RESTORE:
+            exact_fields(request, {"backup_id", "target_name"});
+            history_token(request, "backup_id");
+            instance_target_name(request);
+            break;
+        }
+        return request;
+    }
+    catch (const Error&) { throw Error(Code::invalid_argument); }
+}
+
+void check_backup_summary(const Json& response)
+{
+    history_token(response, "backup_id");
+    response_field(response, "lsn", Json::value_t::number_unsigned);
+    response_field(response, "verified", Json::value_t::boolean);
+    sha256_field(response, "manifest_sha256");
+}
+
+void check_backup_response(sdp_backup_operation operation, const Json& response)
+{
+    switch (operation)
+    {
+    case SDP_BACKUP_SUBMIT:
+    case SDP_BACKUP_STATUS:
+    case SDP_BACKUP_CANCEL:
+        check_job_response(SDP_JOB_STATUS, response);
+        break;
+    case SDP_BACKUP_CATALOG:
+        response_field(response, "pitr", Json::value_t::boolean);
+        for (const auto& entry : response_field(response, "backups", Json::value_t::array))
+            check_backup_summary(entry);
+        break;
+    case SDP_BACKUP_VERIFY:
+        check_backup_summary(response);
+        if (!response_field(response, "verified", Json::value_t::boolean).get<bool>())
+            throw Error(Code::malformed);
+        break;
+    case SDP_BACKUP_RESTORE:
+        check_backup_summary(response);
+        decision_text(response, "target_name", 32);
+        if (!response_field(response, "restored", Json::value_t::boolean).get<bool>())
+            throw Error(Code::malformed);
+        break;
+    case SDP_BACKUP_DELETE:
+        history_token(response, "backup_id");
+        if (!response_field(response, "deleted", Json::value_t::boolean).get<bool>())
+            throw Error(Code::malformed);
+        break;
+    }
+}
+
+constexpr std::array admin_commands{
+    WireCommand{"admin_status", false},
+    WireCommand{"admin_health", false},
+    WireCommand{"admin_health_check", false},
+    WireCommand{"admin_config_preview", false},
+    WireCommand{"admin_config_apply", true},
+    WireCommand{"admin_support_preview", false},
+    WireCommand{"admin_support_create", true},
+    WireCommand{"admin_maintenance_submit", true}};
+static_assert(admin_commands.size() == SDP_ADMIN_MAINTENANCE_SUBMIT);
+
+constexpr std::array<std::string_view, 5> health_checks{"storage", "history", "backup", "certificate", "jobs"};
+
+Json admin_request(sdp_admin_operation operation, sdp_text input)
+{
+    try
+    {
+        auto request = input.size ? sdp::wire::parse_payload(checked_text(input, 64 * 1024)) : Json::object();
+        switch (operation)
+        {
+        case SDP_ADMIN_STATUS:
+        case SDP_ADMIN_HEALTH:
+        case SDP_ADMIN_SUPPORT_PREVIEW:
+            exact_fields(request, {});
+            break;
+        case SDP_ADMIN_HEALTH_CHECK:
+        {
+            exact_fields(request, {"check"});
+            const auto& name = sdp::wire::string_field(request, "check");
+            if (std::ranges::find(health_checks, name) == health_checks.end())
+                throw Error(Code::invalid_argument);
+            break;
+        }
+        case SDP_ADMIN_CONFIG_PREVIEW:
+        case SDP_ADMIN_CONFIG_APPLY:
+        {
+            exact_fields(request, {"config"});
+            const auto& config = sdp::wire::object_field(request, "config");
+            if (config.empty()) throw Error(Code::invalid_argument);
+            only_fields(config, {"timeout_ms", "port", "max_connections"});
+            if (config.contains("timeout_ms")) job_unsigned(config, "timeout_ms", 100, 120000);
+            if (config.contains("port")) job_unsigned(config, "port", 0, 65535);
+            if (config.contains("max_connections")) job_unsigned(config, "max_connections", 1, 128);
+            break;
+        }
+        case SDP_ADMIN_SUPPORT_CREATE:
+            exact_fields(request, {"target_name"});
+            instance_target_name(request);
+            break;
+        case SDP_ADMIN_MAINTENANCE_SUBMIT:
+        {
+            exact_fields(request, {"request_token", "action"});
+            history_token(request, "request_token");
+            const auto& action = sdp::wire::string_field(request, "action");
+            if (action != "integrity" && action != "statistics" && action != "index")
+                throw Error(Code::invalid_argument);
+            break;
+        }
+        }
+        return request;
+    }
+    catch (const Error&) { throw Error(Code::invalid_argument); }
+}
+
+void check_health_record(const Json& record)
+{
+    const auto& status = sdp::wire::string_field(record, "status");
+    if (status != "UNKNOWN" && status != "OK" && status != "ERROR") throw Error(Code::malformed);
+    const auto checked_at = record.find("checked_at");
+    if (checked_at == record.end() || (!checked_at->is_null() && !checked_at->is_number_integer()) ||
+        !record.contains("evidence") || !record.contains("remediation"))
+        throw Error(Code::malformed);
+}
+
+void check_admin_response(sdp_admin_operation operation, const Json& response)
+{
+    switch (operation)
+    {
+    case SDP_ADMIN_STATUS:
+        decision_text(response, "instance_name", 128);
+        decision_text(response, "instance_id", 128);
+        response_field(response, "port", Json::value_t::number_unsigned);
+        response_field(response, "sessions", Json::value_t::array);
+        (void)sdp::wire::object_field(response, "limits");
+        break;
+    case SDP_ADMIN_HEALTH:
+    {
+        decision_text(response, "instance_id", 128);
+        const auto& checks = sdp::wire::object_field(response, "checks");
+        for (const auto name : health_checks) check_health_record(sdp::wire::object_field(checks, name.data()));
+        break;
+    }
+    case SDP_ADMIN_HEALTH_CHECK:
+    {
+        const auto& name = sdp::wire::string_field(response, "check");
+        if (std::ranges::find(health_checks, name) == health_checks.end()) throw Error(Code::malformed);
+        check_health_record(sdp::wire::object_field(response, "result"));
+        break;
+    }
+    case SDP_ADMIN_CONFIG_PREVIEW:
+    case SDP_ADMIN_CONFIG_APPLY:
+        if (!response_field(response, "valid", Json::value_t::boolean).get<bool>() ||
+            response_field(response, "applied", Json::value_t::boolean).get<bool>() != (operation == SDP_ADMIN_CONFIG_APPLY))
+            throw Error(Code::malformed);
+        (void)sdp::wire::object_field(response, "dynamic");
+        (void)sdp::wire::object_field(response, "restart_required");
+        break;
+    case SDP_ADMIN_SUPPORT_PREVIEW:
+    case SDP_ADMIN_SUPPORT_CREATE:
+        response_field(response, "format", Json::value_t::number_unsigned);
+        (void)sdp::wire::object_field(response, "config");
+        (void)sdp::wire::object_field(response, "log_counts");
+        response_field(response, "discarded_records", Json::value_t::number_unsigned);
+        if (!response_field(response, "secret_scan_passed", Json::value_t::boolean).get<bool>())
+            throw Error(Code::malformed);
+        if (operation == SDP_ADMIN_SUPPORT_CREATE) instance_target_name(response);
+        break;
+    case SDP_ADMIN_MAINTENANCE_SUBMIT:
+        check_job_response(SDP_JOB_SUBMIT, response);
+        break;
+    }
 }
 
 Json named_parameters(sdp_text text, const char* discriminator)
@@ -1090,6 +1894,87 @@ sdp_status SDP_CALL sdp_history_command(sdp_connection connection, sdp_history_o
             operation == SDP_HISTORY_PIN || operation == SDP_HISTORY_UNPIN;
         const auto response = require_connection(connection)->request(name, std::move(body), changes_policy || apply);
         if (plan) validate_history_plan_response(response, operation, apply);
+        write_json(*response_json, response);
+    });
+}
+
+sdp_status SDP_CALL sdp_decision_command(sdp_connection connection, sdp_decision_operation operation,
+    sdp_text request_json, sdp_buffer* response_json, sdp_error* error)
+{
+    return boundary(error, [&] {
+        check_output(response_json);
+        const auto name = decision_operation_name(operation);
+        auto body = decision_request(operation, request_json);
+        const bool writing = operation == SDP_DECISION_CREATE || operation == SDP_DECISION_ACTIVATE;
+        const auto response = require_connection(connection)->request(name, std::move(body), writing);
+        check_decision_response(operation, response);
+        write_json(*response_json, response);
+    });
+}
+
+sdp_status SDP_CALL sdp_job_command(sdp_connection connection, sdp_job_operation operation,
+    sdp_text request_json, sdp_buffer* response_json, sdp_error* error)
+{
+    return boundary(error, [&] {
+        check_output(response_json);
+        const auto name = job_operation_name(operation);
+        auto body = job_request(operation, request_json);
+        const bool writing = operation == SDP_JOB_SUBMIT || operation == SDP_JOB_CANCEL ||
+            operation == SDP_JOB_SCHEDULE_CREATE || operation == SDP_JOB_SCHEDULE_CANCEL;
+        const auto response = require_connection(connection)->request(name, std::move(body), writing);
+        check_job_response(operation, response);
+        write_json(*response_json, response);
+    });
+}
+
+sdp_status SDP_CALL sdp_dataset_command(sdp_connection connection, sdp_dataset_operation operation,
+    sdp_text request_json, sdp_buffer* response_json, sdp_error* error)
+{
+    return boundary(error, [&] {
+        check_output(response_json);
+        const auto& operation_spec = wire_command_spec(operation, dataset_commands);
+        auto body = dataset_request(operation, request_json);
+        const auto response = require_connection(connection)->request(operation_spec.name, std::move(body), operation_spec.writes);
+        check_dataset_response(operation, response);
+        write_json(*response_json, response);
+    });
+}
+
+sdp_status SDP_CALL sdp_model_command(sdp_connection connection, sdp_model_operation operation,
+    sdp_text request_json, sdp_buffer* response_json, sdp_error* error)
+{
+    return boundary(error, [&] {
+        check_output(response_json);
+        const auto& operation_spec = wire_command_spec(operation, model_commands);
+        auto body = model_request(operation, request_json);
+        const auto response = require_connection(connection)->request(operation_spec.name, std::move(body), operation_spec.writes);
+        check_model_response(operation, response);
+        write_json(*response_json, response);
+    });
+}
+
+sdp_status SDP_CALL sdp_backup_command(sdp_connection connection, sdp_backup_operation operation,
+    sdp_text request_json, sdp_buffer* response_json, sdp_error* error)
+{
+    return boundary(error, [&] {
+        check_output(response_json);
+        const auto& operation_spec = wire_command_spec(operation, backup_commands);
+        auto body = backup_request(operation, request_json);
+        const auto response = require_connection(connection)->request(operation_spec.name, std::move(body), operation_spec.writes);
+        check_backup_response(operation, response);
+        write_json(*response_json, response);
+    });
+}
+
+sdp_status SDP_CALL sdp_admin_command(sdp_connection connection, sdp_admin_operation operation,
+    sdp_text request_json, sdp_buffer* response_json, sdp_error* error)
+{
+    return boundary(error, [&] {
+        check_output(response_json);
+        const auto& operation_spec = wire_command_spec(operation, admin_commands);
+        auto body = admin_request(operation, request_json);
+        const auto response = require_connection(connection)->request(operation_spec.name, std::move(body), operation_spec.writes);
+        check_admin_response(operation, response);
         write_json(*response_json, response);
     });
 }

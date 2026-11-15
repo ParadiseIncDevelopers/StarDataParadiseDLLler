@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 4.2)
 project(SdpNativePackageConsumer LANGUAGES CXX)
 
-find_package(StarDataParadiseDLLler 0.2.0 EXACT CONFIG REQUIRED)
+find_package(StarDataParadiseDLLler 0.3.0 EXACT CONFIG REQUIRED)
 
 add_executable(sdp_native_consumer main.cpp)
 target_compile_features(sdp_native_consumer PRIVATE cxx_std_20)

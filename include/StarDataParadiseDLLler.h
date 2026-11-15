@@ -178,6 +178,105 @@ enum
 SDP_API sdp_status SDP_CALL sdp_history_command(sdp_connection connection, sdp_history_operation operation,
     sdp_text request_json, sdp_buffer* response_json, sdp_error* error);
 
+typedef uint32_t sdp_decision_operation;
+enum
+{
+    SDP_DECISION_CREATE = 1,
+    SDP_DECISION_VALIDATE = 2,
+    SDP_DECISION_ACTIVATE = 3,
+    SDP_DECISION_TEST = 4,
+    SDP_DECISION_EXPLAIN = 5,
+    SDP_DECISION_WHYNOT = 6,
+    SDP_DECISION_WHATIF = 7,
+    SDP_DECISION_RECHECK = 8
+};
+/* Request and response are UTF-8 JSON objects. Free a successful response with sdp_buffer_free. */
+SDP_API sdp_status SDP_CALL sdp_decision_command(sdp_connection connection, sdp_decision_operation operation,
+    sdp_text request_json, sdp_buffer* response_json, sdp_error* error);
+
+typedef uint32_t sdp_job_operation;
+enum
+{
+    SDP_JOB_SUBMIT = 1,
+    SDP_JOB_STATUS = 2,
+    SDP_JOB_WATCH = 3,
+    SDP_JOB_CANCEL = 4,
+    SDP_JOB_SCHEDULE_CREATE = 5,
+    SDP_JOB_SCHEDULE_STATUS = 6,
+    SDP_JOB_SCHEDULE_CANCEL = 7,
+    SDP_JOB_CAPABILITIES = 8
+};
+/* Request and response are UTF-8 JSON objects. Free a successful response with sdp_buffer_free. */
+SDP_API sdp_status SDP_CALL sdp_job_command(sdp_connection connection, sdp_job_operation operation,
+    sdp_text request_json, sdp_buffer* response_json, sdp_error* error);
+
+// ML operations send a UTF-8 JSON object and return a buffer deallocated by sdp_buffer_free.
+typedef uint32_t sdp_dataset_operation;
+enum
+{
+    SDP_DATASET_CREATE = 1,
+    SDP_DATASET_GET = 2,
+    SDP_DATASET_DELETE = 3,
+    SDP_DATASET_PLSQL_SUBMIT = 4
+};
+
+SDP_API sdp_status SDP_CALL sdp_dataset_command(sdp_connection connection, sdp_dataset_operation operation,
+    sdp_text request_json, sdp_buffer* response_json, sdp_error* error);
+
+typedef uint32_t sdp_model_operation;
+enum
+{
+    SDP_MODEL_CREATE = 1,
+    SDP_MODEL_STATUS = 2,
+    SDP_MODEL_TRAIN = 3,
+    SDP_MODEL_EVALUATE = 4,
+    SDP_MODEL_PREDICT = 5,
+    SDP_MODEL_ACTIVATE = 6,
+    SDP_MODEL_COMPARE = 7,
+    SDP_MODEL_CHECKPOINT = 8,
+    SDP_MODEL_RESUME = 9,
+    SDP_MODEL_DEACTIVATE = 10,
+    SDP_MODEL_ROLLBACK = 11,
+    SDP_MODEL_DELETE = 12,
+    SDP_MODEL_DEVICES = 13
+};
+
+SDP_API sdp_status SDP_CALL sdp_model_command(sdp_connection connection, sdp_model_operation operation,
+    sdp_text request_json, sdp_buffer* response_json, sdp_error* error);
+
+// Backup operations use JSON and return a buffer deallocated by sdp_buffer_free.
+typedef uint32_t sdp_backup_operation;
+enum
+{
+    SDP_BACKUP_SUBMIT = 1,
+    SDP_BACKUP_STATUS = 2,
+    SDP_BACKUP_CANCEL = 3,
+    SDP_BACKUP_CATALOG = 4,
+    SDP_BACKUP_VERIFY = 5,
+    SDP_BACKUP_RESTORE = 6,
+    SDP_BACKUP_DELETE = 7
+};
+
+SDP_API sdp_status SDP_CALL sdp_backup_command(sdp_connection connection, sdp_backup_operation operation,
+    sdp_text request_json, sdp_buffer* response_json, sdp_error* error);
+
+// Instance administration uses the authenticated Server session and does not control OS services.
+typedef uint32_t sdp_admin_operation;
+enum
+{
+    SDP_ADMIN_STATUS = 1,
+    SDP_ADMIN_HEALTH = 2,
+    SDP_ADMIN_HEALTH_CHECK = 3,
+    SDP_ADMIN_CONFIG_PREVIEW = 4,
+    SDP_ADMIN_CONFIG_APPLY = 5,
+    SDP_ADMIN_SUPPORT_PREVIEW = 6,
+    SDP_ADMIN_SUPPORT_CREATE = 7,
+    SDP_ADMIN_MAINTENANCE_SUBMIT = 8
+};
+
+SDP_API sdp_status SDP_CALL sdp_admin_command(sdp_connection connection, sdp_admin_operation operation,
+    sdp_text request_json, sdp_buffer* response_json, sdp_error* error);
+
 // A queued health operation invokes completion once. The error pointer is valid during completion.
 SDP_API sdp_status SDP_CALL sdp_health_async(sdp_connection connection, sdp_completion completion,
     void* context, sdp_error* error);

@@ -61,12 +61,61 @@ RETAIN ve PURGE için `revision` açıkça seçilir. PIN ve UNPIN `pin_kind` ve 
 
 Onaylanan uygulama `status: committed`, yeni `lsn` ve `replayed` bilgisini döndürür. Yanıt kaybında C API `unknown_outcome` işaretleyebilir. Çağıran aynı kimlikle yeniden bağlanıp `sdp_tx_outcome` ile token sonucunu sorgulayabilir. Aynı plan ve token’ın tekrar gönderilmesi dayanıklı kaydı kullanır. Mevcut revision değişmişse yeni bir önizleme gerekir.
 
+## Decision
+
+`decision_explain_v1` yeteneğini ilan eden Server ile `sdp_decision_command` ve `sdp_decision_operation` kullanılır. Çağrı UTF-8 JSON istek nesnesi alır ve `sdp_buffer_free` ile bırakılan bir yanıt nesnesi döndürür.
+
+`SDP_DECISION_CREATE` ve `SDP_DECISION_ACTIVATE`, katalog komutu olarak `sql` ve 32 küçük harfli hex karakterden oluşan `request_token` alır. Başarılı yanıt `affected_rows` ve commit `lsn` değerini içerir. İletim kesilirse `unknown_outcome` ile `sdp_tx_outcome` kullanılır. `SDP_DECISION_VALIDATE` yalnız `sql` alır ve geçerli tanım için `valid` değerini döndürür.
+
+EXPLAIN, WHYNOT, WHATIF ve RECHECK bir SQL nesne adı olan `target`, `insert`, `update` veya `delete` olayını gösteren `event` ve gerektiğinde `row_id`, `revision` ve `proposed` alır. Kimlikler pozitif ondalık dizge olarak verilmelidir. `proposed` içindeki sütun değerleri SQL tip etiketlerini kullanır. Örneğin `{"target":"items","event":"insert","proposed":{"id":{"t":"i64","v":"3"}}}` bir ekleme senaryosudur. Bu araçlar gerçek tablo satırı yazmadan geçerli kuralları ve bağlamı kullanır. Başarılı yanıtta `allowed` kararı, `reason`, `rules` ve yetkiye göre tipli `computed` değerler bulunur.
+
+`SDP_DECISION_TEST` aynı tablo ve senaryolar üzerinde iki kural sürümünü karşılaştırır. `target`, `rule`, pozitif tamsayı `from_version` ve `to_version`, isteğe bağlı `revision` ve en fazla 16 öğelik `cases` dizisi alır. Her senaryo üst düzey tablo ve snapshot’ı kullanır. Yanıt `changed` sayısını ve her senaryonun `prior` ile `candidate` açıklamasını içerir.
+
+## Kalıcı işler ve takvim
+
+`jobs_v1` yeteneğini ilan eden Server ile `sdp_job_command` ve `sdp_job_operation` kullanılır. Girdi ve çıktı UTF-8 JSON nesnesidir. Çağıran başarılı yanıtı `sdp_buffer_free` ile serbest bırakır. CAPABILITIES boş nesne alır ve sunucunun iş türlerini, eşzamanlılığı ve gerçek kaynak sınırlarını döndürür.
+
+`SDP_JOB_SUBMIT` için `kind` alanı `compute`, `count` 1–1.000.000.000 aralığında tam sayı ve `request_token` 32 küçük harfli hex karakterdir. İsteğe bağlı `timeout_ms`, `memory_mib` ve `output_bytes` kaynak sınırlarını seçer. Autocommit yanıtı `lsn` döndürebilir. Açık SQL transaction içindeki talep commit sonrasında çalıştırılır ve rollback talebi kaldırır. Durum, izleme ve iptal için yanıttaki `job_id` kullanılır.
+
+WATCH son durumla birlikte sınırlı durum olayı dizisini döndürür. Worker gerçek toplam ve tamamlanan miktarı raporlarsa `progress` nesnesi bulunur. `cancel_requested` iptal isteğini, `state: cancelled` kesin son durumu gösterir. İstemci kapandıktan sonra aynı kimlikle yeni bağlantı işin durumunu okuyabilir. İletim sonrası bağlantı kaybında SDK yazma isteğini otomatik yinelemez.
+
+`SDP_JOB_SCHEDULE_CREATE` aynı iş alanlarını, bir aralık kuralı `{"every_seconds":60}` veya günlük kural `{"timezone":"UTC","hour":9,"minute":30}` ile birlikte alır. İsteğe bağlı `misfire` değeri `skip` veya `run_once` olur. `retries` ve `backoff_seconds` geçici başarısızlıklara uygulanır. STATUS ve CANCEL `schedule_id` ile çağrılır.
+
+## Veri kümeleri ve modeller
+
+`sdp_dataset_command` işlemi `sdp_dataset_operation` ile, `sdp_model_command` işlemi `sdp_model_operation` ile seçer. İstek en fazla 64 KiB UTF-8 JSON nesnesidir. Boş istek boş nesneye karşılık gelir. Başarılı yanıt `sdp_buffer_free` ile bırakılır. Sunucu, veri kümesi ve model işlemlerinde oturumun yetkilerini denetler.
+
+`SDP_DATASET_CREATE` bir `SELECT` sorgusu olan `sql`, dönüşüm ve bölme için `options`, `request_token` ve isteğe bağlı `parameter_types` ile `parameters` alır. Yanıt oluşturulan snapshot’ın `dataset_id`, kaynak `revision`, `row_count` ve `byte_count` alanlarını içerir. GET ve DELETE yalnız `dataset_id` alır. `SDP_DATASET_GET` kaynak ve hazırlanmış veri bilgilerini verir. `SDP_DATASET_PLSQL_SUBMIT` veri kümesi kimliği ile `routine`, en fazla 64 sıfır tabanlı `indices`, parametre adlarını sütun adlarına eşleyen `arguments` ve `request_token` alır.
+
+Model işlemleri SQL nitelikli `name` kullanır. CREATE `algorithm` ve `request_token` alır. STATUS geçerli etkin sürümü ve kayıtlı sürümleri verir. TRAIN `dataset_id`, `request_token` ve isteğe bağlı `seed` ile algoritma `options` alır. Veri kümesi PL/SQL, TRAIN ve RESUME yanıtlarından alınan `job_id` değerleri `sdp_job_command` ile izlenir. EVALUATE isteğe bağlı pozitif `version` alır ve model çıktısıyla metrikleri verir. PREDICT `features` nesnesiyle etkin sürümü kullanır. COMPARE, `split` ve her biri `name` ile pozitif `version` içeren 2–8 öğeli `runs` dizisi alır.
+
+CPU MLP için TRAIN isteğinde `pause_after_epoch` verilirse iş bir epoch sınırında duraklatılabilir. CHECKPOINT, model `name` ve duraklatılmış `job_id` ile `dataset_id`, `checksum`, `epoch` ve `runtime` bilgisini verir. RESUME, aynı `name`, `job_id`, `checksum` ve `request_token` ile yeni bir iş kuyruğa alır. `SDP_MODEL_DEVICES` boş nesne veya isteğe bağlı `device_index` ve `memory_mib` alır. Cihaz yanıtı CPU kullanılabilirliğini, GPU doğrulamasını ve donanım listesini bildirir. TRAIN isteğinde `device` olarak `cpu` veya `gpu` istenebilir. GPU isteğinin CPU’da çalışabilmesi için çağıran `allow_cpu_fallback` değerini açıkça true seçer.
+
+ACTIVATE ve ROLLBACK istekleri `name`, pozitif `version` ve `request_token` alır. DEACTIVATE `name` ve `request_token` ile etkin sürümü kaldırır. DELETE `name`, pozitif `version` ve `request_token` ile etkin olmayan bir sürümü siler. Token bulunan bir yazmada bağlantı kaybı `unknown_outcome` döndürürse aynı kimlikle açılan yeni bağlantıdan `sdp_tx_outcome` kullanılır.
+
+## Backup ve geri yükleme
+
+`sdp_backup_command` ve `sdp_backup_operation` yapılandırılmış arşiv dizinine sahip sunucuda yönetici işlemlerini seçer. Çağrı 64 KiB’ye kadar UTF-8 JSON isteği alır. Başarılı yanıtı `sdp_buffer_free` ile serbest bırak.
+
+SUBMIT, `request_token` ve isteğe bağlı 1–536.870.912 baytlık `max_bytes` alır. Varsayılan üst sınır 536.870.912 bayttır. Yanıttaki `job_id` ile aynı kimlikten STATUS ve CANCEL çağrılır. İstemci kapansa da iş sunucuda sürer. CATALOG boş nesne alır ve arşivlerin `backup_id`, `lsn`, `manifest_sha256` ve `verified` alanlarını verir. WAL arşiv zinciri olmadığı için `pitr` kapalıdır.
+
+VERIFY ve DELETE yalnız `backup_id` alır. VERIFY geçici instance’a restore ve içerik denetimi tamamlanınca doğrulanmış durumu verir. RESTORE ayrıca 1–32 küçük ASCII harf, rakam, çizgi veya alt çizgiden oluşan `target_name` alır. Sunucu instance’ın geçici çalışma kökündeki restores dizininde yeni bir hedef oluşturur. Restore hedefi olarak mevcut bir instance üzerine yazılamaz. Arşiv silme yanıtı kaybolursa etkin arşiv durumu CATALOG ile okunabilir.
+Yedek takvimi için `sdp_job_command` üzerinden `SDP_JOB_SCHEDULE_CREATE`, `kind:"backup"`, bir takvim `rule` nesnesi ve `request_token` kullanılır. Yedek takvimi isteğe bağlı `max_bytes` ve takvim seçeneklerini kabul eder. Genel takvim STATUS ve CANCEL işlemleri alınan `schedule_id` ile çalışır.
+
+## Instance yönetimi, sağlık ve bakım
+
+`sdp_admin_command` yönetici kimliğiyle `sdp_admin_operation` seçer. Girdi en fazla 64 KiB UTF-8 JSON nesnesidir. Başarılı yanıtı `sdp_buffer_free` ile bırak. STATUS, HEALTH ve SUPPORT_PREVIEW boş nesne alır. STATUS instance kimliğini, etkin dinleyiciyi ve Sunucu ölçümlerini verir. HEALTH her kontrol için `status`, `checked_at`, `evidence` ve `remediation` döndürür. HEALTH_CHECK, `check` alanında `storage`, `history`, `backup`, `certificate` veya `jobs` alır ve güncel ölçümü döndürür. Henüz ölçülmemiş kontrol `UNKNOWN` olarak kalır.
+
+CONFIG_PREVIEW ve CONFIG_APPLY `config` nesnesinde `timeout_ms`, `port` veya `max_connections` alır. `timeout_ms` 100–120.000 aralığında dinamik ayardır. `port` 0–65.535 ve `max_connections` 1–128 aralıklarında yeniden başlatma gerektirir. Yanıt `dynamic` ve `restart_required` alanlarını ayırır. APPLY önceki yapılandırmayı saklar. Sunucu işlemi çalıştıran işletim sistemi hizmeti yerel yönetim araçlarıyla yönetilir.
+
+SUPPORT_CREATE, 1–32 küçük ASCII harf, rakam, çizgi veya alt çizgiden oluşan `target_name` alır. Sunucuda yayımlanan destek paketi, izin verilen yapılandırma alanlarıyla redakte edilmiş log özetini ve sır taraması sonucunu içerir. MAINTENANCE_SUBMIT `action` olarak `integrity`, `statistics` veya `index` ve bir `request_token` ister. Dönen `job_id` standart `sdp_job_command` ile izlenir.
+
 ## Paket kullanımı
 
 Paketin SHA-256 değerini kontrol ettikten sonra ZIP'i aç ve kurulum dizinini `CMAKE_PREFIX_PATH` ile ver.
 
 ```cmake
-find_package(StarDataParadiseDLLler 0.2.0 EXACT CONFIG REQUIRED)
+find_package(StarDataParadiseDLLler 0.3.0 EXACT CONFIG REQUIRED)
 target_link_libraries(my_client PRIVATE StarDataParadise::StarDataParadiseDLLler)
 ```
 

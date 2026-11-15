@@ -859,11 +859,451 @@ void restore_roundtrip(sdp_connection handle, sdp_open_options options, Password
     fresh.close(selected);
 }
 
+std::string decision(SqlClient& actor, sdp_connection connection, sdp_decision_operation operation,
+    std::string_view input)
+{
+    Buffer output;
+    expect(sdp_decision_command(connection, operation, text(input), &output.value, &actor.error_),
+        SDP_OK, actor.error_);
+    return take(output);
+}
+
+std::string decision_sql(std::string_view sql, std::string_view token = {})
+{
+    auto json = "{\"sql\":\"" + std::string(sql) + "\"";
+    if (!token.empty()) json += ",\"request_token\":\"" + std::string(token) + "\"";
+    return json + "}";
+}
+
+void decision_roundtrip(sdp_connection handle)
+{
+    SqlClient client(handle);
+    constexpr auto rule_token = "00000000000000000000000000000501"sv;
+    constexpr auto activate_token = "00000000000000000000000000000503"sv;
+    constexpr auto first = "CREATE DECISION RULE minimum_stock ON stocked_items FOR INSERT "
+        "PRIORITY 100 WHEN (NEW.stock >= 5) THEN ALLOW"sv;
+    constexpr auto next = "CREATE DECISION RULE minimum_stock ON stocked_items FOR INSERT "
+        "PRIORITY 100 WHEN (NEW.stock >= 2) THEN ALLOW"sv;
+    constexpr auto scenario = R"({"target":"stocked_items","event":"insert","proposed":{"id":{"t":"i64","v":"2"},"stock":{"t":"i64","v":"3"}}})"sv;
+    Buffer capabilities;
+    expect(sdp_get_capabilities(handle, &capabilities.value, &client.error_), SDP_OK, client.error_);
+    require(take(capabilities).find("\"decision_explain_v1\":true") != std::string::npos,
+        "Decision ABI fixture requires the advertised explanation capability");
+    {
+        Buffer rejected;
+        expect(sdp_decision_command(handle, 0, text("{}"), &rejected.value, &client.error_),
+            SDP_INVALID_ARGUMENT, client.error_);
+        expect(sdp_decision_command(handle, SDP_DECISION_WHATIF,
+            text(R"({"target":"stocked_items","event":"truncate"})"), &rejected.value, &client.error_),
+            SDP_INVALID_ARGUMENT, client.error_);
+        require(!rejected.value.data && !client.error_.unknown_outcome,
+            "invalid Decision payload marked an unknown outcome or returned a buffer");
+    }
+
+    client.write("CREATE TABLE stocked_items (id BIGINT PRIMARY KEY, stock BIGINT NOT NULL)",
+        "00000000000000000000000000000500");
+    const auto before_validation = history(client, handle, SDP_HISTORY_STATUS);
+    std::cout << "decision_validate " << decision(client, handle, SDP_DECISION_VALIDATE, decision_sql(first)) << '\n';
+    require(history(client, handle, SDP_HISTORY_STATUS) == before_validation,
+        "rule validation changed the current revision");
+
+    const auto created = decision(client, handle, SDP_DECISION_CREATE, decision_sql(first, rule_token));
+    const auto revision = json_id(created, "lsn");
+    std::cout << "decision_created " << created << '\n';
+    client.outcome(rule_token, "decision_ledger");
+
+    const auto before_simulation = history(client, handle, SDP_HISTORY_STATUS);
+    const auto blocked = client.prepare("INSERT INTO stocked_items VALUES (2,3)");
+    {
+        Buffer rejected;
+        expect(sdp_execute(handle, text(blocked), {}, text("00000000000000000000000000000505"), 10,
+            &rejected.value, &client.error_), SDP_PERMISSION_DENIED, client.error_);
+        require(!rejected.value.data && !client.error_.unknown_outcome &&
+            std::string_view(client.error_.message).ends_with("(denied)"), "Native Decision denial lost its safe reason");
+    }
+    client.close(blocked);
+    std::cout << "decision_why " << decision(client, handle, SDP_DECISION_WHYNOT, scenario) << '\n';
+    std::cout << "decision_whatif " << decision(client, handle, SDP_DECISION_WHATIF, scenario) << '\n';
+    std::cout << "decision_recheck " << decision(client, handle, SDP_DECISION_RECHECK, scenario) << '\n';
+    require(history(client, handle, SDP_HISTORY_STATUS) == before_simulation,
+        "Decision inspection changed the current revision");
+
+    std::cout << "decision_appended " << decision(client, handle, SDP_DECISION_CREATE,
+        decision_sql(next, "00000000000000000000000000000502")) << '\n';
+    auto historical = std::string(scenario);
+    historical.pop_back();
+    historical += ",\"revision\":\"" + revision + "\"}";
+    std::cout << "decision_historical " << decision(client, handle, SDP_DECISION_EXPLAIN, historical) << '\n';
+    constexpr auto cases = R"({"target":"stocked_items","rule":"minimum_stock","from_version":1,"to_version":2,"cases":[{"event":"insert","proposed":{"id":{"t":"i64","v":"2"},"stock":{"t":"i64","v":"3"}}},{"event":"insert","proposed":{"id":{"t":"i64","v":"3"},"stock":{"t":"i64","v":"10"}}}]})"sv;
+    const auto before_corpus = history(client, handle, SDP_HISTORY_STATUS);
+    std::cout << "decision_test " << decision(client, handle, SDP_DECISION_TEST, cases) << '\n';
+    require(history(client, handle, SDP_HISTORY_STATUS) == before_corpus,
+        "rule comparison changed the current revision");
+
+    const auto selected = client.prepare("SELECT id,stock FROM stocked_items ORDER BY id");
+    client.fetch(json_id(client.execute(selected)), 10, "decision_before");
+    std::cout << "decision_activated " << decision(client, handle, SDP_DECISION_ACTIVATE, decision_sql(
+        "ALTER DECISION RULE minimum_stock ON stocked_items ACTIVATE VERSION 2", activate_token)) << '\n';
+    std::cout << "decision_now " << decision(client, handle, SDP_DECISION_EXPLAIN, scenario) << '\n';
+    client.write("INSERT INTO stocked_items VALUES (2,3)", "00000000000000000000000000000504");
+    client.fetch(json_id(client.execute(selected)), 10, "decision_after");
+    client.close(selected);
+}
+
+std::string job(SqlClient& actor, sdp_connection connection, sdp_job_operation operation, std::string_view input = "{}")
+{
+    Buffer output;
+    expect(sdp_job_command(connection, operation, text(input), &output.value, &actor.error_),
+        SDP_OK, actor.error_);
+    return take(output);
+}
+
+std::string job_selector(std::string_view field, std::string_view id)
+{
+    return "{\"" + std::string(field) + "\":\"" + std::string(id) + "\"}";
+}
+
+std::string await_job(SqlClient& actor, sdp_connection connection, std::string_view selector,
+    std::string_view final_state)
+{
+    const auto wanted = "\"state\":\"" + std::string(final_state) + "\"";
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    do
+    {
+        auto status = job(actor, connection, SDP_JOB_WATCH, selector);
+        if (status.find(wanted) != status.npos) return status;
+        if (status.find("\"state\":\"failed\"") != status.npos ||
+            status.find("\"state\":\"succeeded\"") != status.npos ||
+            status.find("\"state\":\"cancelled\"") != status.npos)
+            throw std::runtime_error("Job entered an unexpected terminal state");
+        Sleep(30);
+    } while (std::chrono::steady_clock::now() < deadline);
+    throw std::runtime_error("Job did not enter its final state within the fixture bound");
+}
+
+std::string dataset(sdp_connection connection, sdp_dataset_operation operation, std::string_view input)
+{
+    Buffer output;
+    sdp_error error{};
+    expect(sdp_dataset_command(connection, operation, text(input), &output.value, &error), SDP_OK, error);
+    return take(output);
+}
+
+std::string model(sdp_connection connection, sdp_model_operation operation, std::string_view input)
+{
+    Buffer output;
+    sdp_error error{};
+    expect(sdp_model_command(connection, operation, text(input), &output.value, &error), SDP_OK, error);
+    return take(output);
+}
+
+void ml_roundtrip(sdp_connection connection)
+{
+    SqlClient actor(connection);
+    {
+        Buffer rejected;
+        sdp_error error{};
+        expect(sdp_dataset_command(connection, 99, text("{}"), &rejected.value, &error),
+            SDP_INVALID_ARGUMENT, error);
+        expect(sdp_model_command(connection, 99, text("{}"), &rejected.value, &error),
+            SDP_INVALID_ARGUMENT, error);
+        expect(sdp_model_command(connection, SDP_MODEL_RESUME, text(
+            R"({"name":"sdk_model","job_id":"11111111111111111111111111111111","checksum":"bad","request_token":"00000000000000000000000000000229"})"),
+            &rejected.value, &error), SDP_INVALID_ARGUMENT, error);
+        require(!rejected.value.data && !error.unknown_outcome && !error.correlation_id[0],
+            "invalid ML request crossed the ABI boundary");
+    }
+    const auto devices = model(connection, SDP_MODEL_DEVICES, R"({"device_index":0,"memory_mib":128})");
+    std::cout << "ml_devices " << devices << '\n';
+    actor.write("CREATE TABLE sdk_ml (x BIGINT PRIMARY KEY, y BIGINT)", "00000000000000000000000000000201");
+    actor.write(R"(INSERT INTO sdk_ml VALUES (0,4),(1,7),(2,10),(3,13),(4,16),
+        (5,19),(6,22),(7,25),(8,28),(9,31))", "00000000000000000000000000000202");
+    const auto created = dataset(connection, SDP_DATASET_CREATE, R"({
+        "request_token":"00000000000000000000000000000203",
+        "sql":"SELECT x,y FROM sdk_ml ORDER BY x",
+        "options":{
+            "features":[{"column":"x","transform":"numeric","impute":"reject"}],
+            "target":"y","split":{"mode":"time","time":"x","train":60,"validation":20}
+        }
+    })");
+    const auto dataset_id = json_id(created, "dataset_id");
+    std::cout << "ml_dataset " << created << '\n';
+    std::cout << "ml_materialized " << dataset(connection, SDP_DATASET_GET, job_selector("dataset_id", dataset_id)) << '\n';
+
+    std::cout << "ml_model " << model(connection, SDP_MODEL_CREATE,
+        R"({"name":"sdk_model","algorithm":"linear","request_token":"00000000000000000000000000000204"})") << '\n';
+    const auto train = model(connection, SDP_MODEL_TRAIN,
+        "{\"name\":\"sdk_model\",\"dataset_id\":\"" + dataset_id +
+        "\",\"seed\":87,\"request_token\":\"00000000000000000000000000000205\"}");
+    const auto train_id = json_id(train, "job_id");
+    std::cout << "ml_train " << train << '\n';
+    std::cout << "ml_trained " << await_job(actor, connection, job_selector("job_id", train_id), "succeeded") << '\n';
+    {
+        Buffer rejected;
+        sdp_error error{};
+        const auto checkpoint = "{\"name\":\"sdk_model\",\"job_id\":\"" + train_id + "\"}";
+        expect(sdp_model_command(connection, SDP_MODEL_CHECKPOINT, text(checkpoint), &rejected.value, &error),
+            SDP_INVALID_ARGUMENT, error);
+        require(!rejected.value.data && !error.unknown_outcome && error.correlation_id[0],
+            "completed linear job incorrectly exposed a checkpoint");
+    }
+    std::cout << "ml_status " << model(connection, SDP_MODEL_STATUS, R"({"name":"sdk_model"})") << '\n';
+    std::cout << "ml_evaluate " << model(connection, SDP_MODEL_EVALUATE, R"({"name":"sdk_model","version":1})") << '\n';
+    std::cout << "ml_activate " << model(connection, SDP_MODEL_ACTIVATE,
+        R"({"name":"sdk_model","version":1,"request_token":"00000000000000000000000000000206"})") << '\n';
+    std::cout << "ml_predict " << model(connection, SDP_MODEL_PREDICT, R"({"name":"sdk_model","features":{"x":12}})") << '\n';
+    std::cout << "ml_deactivate " << model(connection, SDP_MODEL_DEACTIVATE,
+        R"({"name":"sdk_model","request_token":"00000000000000000000000000000207"})") << '\n';
+    {
+        Buffer rejected;
+        sdp_error error{};
+        expect(sdp_model_command(connection, SDP_MODEL_PREDICT, text(R"({"name":"sdk_model","features":{"x":12}})"),
+            &rejected.value, &error), SDP_INVALID_STATE, error);
+        require(!rejected.value.data && !error.unknown_outcome && error.correlation_id[0],
+            "predict without an active artifact lacked a definite server error");
+    }
+    const auto second = model(connection, SDP_MODEL_TRAIN,
+        "{\"name\":\"sdk_model\",\"dataset_id\":\"" + dataset_id +
+        "\",\"seed\":88,\"request_token\":\"00000000000000000000000000000211\"}");
+    await_job(actor, connection, job_selector("job_id", json_id(second, "job_id")), "succeeded");
+    std::cout << "ml_compare " << model(connection, SDP_MODEL_COMPARE,
+        R"({"runs":[{"name":"sdk_model","version":1},{"name":"sdk_model","version":2}],"split":"test"})") << '\n';
+    std::cout << "ml_activate_second " << model(connection, SDP_MODEL_ACTIVATE,
+        R"({"name":"sdk_model","version":2,"request_token":"00000000000000000000000000000212"})") << '\n';
+    std::cout << "ml_rollback " << model(connection, SDP_MODEL_ROLLBACK,
+        R"({"name":"sdk_model","version":1,"request_token":"00000000000000000000000000000208"})") << '\n';
+    std::cout << "ml_delete_second " << model(connection, SDP_MODEL_DELETE,
+        R"({"name":"sdk_model","version":2,"request_token":"00000000000000000000000000000213"})") << '\n';
+    std::cout << "ml_deactivate_again " << model(connection, SDP_MODEL_DEACTIVATE,
+        R"({"name":"sdk_model","request_token":"00000000000000000000000000000209"})") << '\n';
+    std::cout << "ml_delete " << model(connection, SDP_MODEL_DELETE,
+        R"({"name":"sdk_model","version":1,"request_token":"00000000000000000000000000000210"})") << '\n';
+    std::cout << "ml_status_after_delete " << model(connection, SDP_MODEL_STATUS, R"({"name":"sdk_model"})") << '\n';
+}
+
+std::string backup(sdp_connection connection, sdp_backup_operation operation, std::string_view input = "{}")
+{
+    Buffer output;
+    sdp_error error{};
+    expect(sdp_backup_command(connection, operation, text(input), &output.value, &error), SDP_OK, error);
+    return take(output);
+}
+
+void backup_roundtrip(sdp_connection connection)
+{
+    SqlClient actor(connection);
+    {
+        constexpr auto invalid_restore = R"({"backup_id":"11111111111111111111111111111111","target_name":"../outside"})"sv;
+        Buffer rejected;
+        sdp_error error{};
+        expect(sdp_backup_command(connection, 99, text("{}"), &rejected.value, &error),
+            SDP_INVALID_ARGUMENT, error);
+        expect(sdp_backup_command(connection, SDP_BACKUP_RESTORE, text(invalid_restore), &rejected.value, &error),
+            SDP_INVALID_ARGUMENT, error);
+        require(!rejected.value.data && !error.unknown_outcome && !error.correlation_id[0],
+            "invalid backup request crossed the ABI boundary");
+    }
+    actor.write("CREATE TABLE sdk_backup (id BIGINT PRIMARY KEY,note TEXT)",
+        "00000000000000000000000000000281");
+    actor.write("INSERT INTO sdk_backup VALUES (1,'archive row')",
+        "00000000000000000000000000000282");
+    const auto queued = backup(connection, SDP_BACKUP_SUBMIT,
+        R"({"request_token":"00000000000000000000000000000283","max_bytes":67108864})");
+    const auto job_id = json_id(queued, "job_id");
+    std::cout << "backup_queued " << queued << '\n';
+    const auto complete = await_job(actor, connection, job_selector("job_id", job_id), "succeeded");
+    std::cout << "backup_complete " << complete << '\n';
+    std::cout << "backup_status " << backup(connection, SDP_BACKUP_STATUS, job_selector("job_id", job_id)) << '\n';
+
+    const auto backup_id = json_id(complete, "backup_id");
+    const auto archive_selector = job_selector("backup_id", backup_id);
+    std::cout << "backup_catalog " << backup(connection, SDP_BACKUP_CATALOG) << '\n';
+    std::cout << "backup_verified " << backup(connection, SDP_BACKUP_VERIFY, archive_selector) << '\n';
+    std::cout << "backup_restored " << backup(connection, SDP_BACKUP_RESTORE,
+        "{\"backup_id\":\"" + backup_id + "\",\"target_name\":\"sdk_copy\"}") << '\n';
+    std::cout << "backup_deleted " << backup(connection, SDP_BACKUP_DELETE, archive_selector) << '\n';
+    std::cout << "backup_final_catalog " << backup(connection, SDP_BACKUP_CATALOG) << '\n';
+
+    const auto scheduled = job(actor, connection, SDP_JOB_SCHEDULE_CREATE,
+        R"({"kind":"backup","rule":{"every_seconds":2},"max_bytes":67108864,"request_token":"00000000000000000000000000000284"})");
+    const auto schedule = job_selector("schedule_id", json_id(scheduled, "schedule_id"));
+    std::cout << "backup_schedule " << scheduled << '\n';
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        const auto status = job(actor, connection, SDP_JOB_SCHEDULE_STATUS, schedule);
+        if (status.find("\"last_job_id\":\"") != status.npos)
+        {
+            const auto scheduled_job = job_selector("job_id", json_id(status, "last_job_id"));
+            std::cout << "backup_schedule_cancelled " << job(actor, connection, SDP_JOB_SCHEDULE_CANCEL, schedule) << '\n';
+            std::cout << "backup_scheduled_result " << await_job(actor, connection, scheduled_job, "succeeded") << '\n';
+            return;
+        }
+        Sleep(30);
+    }
+    throw std::runtime_error("Native backup schedule did not dispatch a job");
+}
+
+std::string admin(sdp_connection connection, sdp_admin_operation operation, std::string_view input = "{}")
+{
+    Buffer output;
+    sdp_error error{};
+    expect(sdp_admin_command(connection, operation, text(input), &output.value, &error), SDP_OK, error);
+    return take(output);
+}
+
+void admin_roundtrip(sdp_connection connection)
+{
+    SqlClient actor(connection);
+    {
+        Buffer rejected;
+        sdp_error error{};
+        expect(sdp_admin_command(connection, 99, text("{}"), &rejected.value, &error),
+            SDP_INVALID_ARGUMENT, error);
+        expect(sdp_admin_command(connection, SDP_ADMIN_CONFIG_APPLY, text(R"({"config":{"data_dir":"elsewhere"}})"),
+            &rejected.value, &error), SDP_INVALID_ARGUMENT, error);
+        expect(sdp_admin_command(connection, SDP_ADMIN_SUPPORT_CREATE, text(R"({"target_name":"../elsewhere"})"),
+            &rejected.value, &error), SDP_INVALID_ARGUMENT, error);
+        require(!rejected.value.data && !error.unknown_outcome && !error.correlation_id[0],
+            "invalid admin request crossed the ABI boundary");
+    }
+
+    std::cout << "admin_status " << admin(connection, SDP_ADMIN_STATUS) << '\n';
+    std::cout << "admin_health_before " << admin(connection, SDP_ADMIN_HEALTH) << '\n';
+    std::cout << "admin_storage " << admin(connection, SDP_ADMIN_HEALTH_CHECK,
+        R"({"check":"storage"})") << '\n';
+    std::cout << "admin_health_after " << admin(connection, SDP_ADMIN_HEALTH) << '\n';
+    std::cout << "admin_config_preview " << admin(connection, SDP_ADMIN_CONFIG_PREVIEW,
+        R"({"config":{"timeout_ms":8500,"port":13393,"max_connections":12}})") << '\n';
+    std::cout << "admin_config_applied " << admin(connection, SDP_ADMIN_CONFIG_APPLY,
+        R"({"config":{"timeout_ms":8500}})") << '\n';
+
+    actor.write("CREATE TABLE sdk_maintenance (id BIGINT PRIMARY KEY,note TEXT)",
+        "00000000000000000000000000000301");
+    actor.write("INSERT INTO sdk_maintenance VALUES (1,'maintenance row')",
+        "00000000000000000000000000000302");
+    std::cout << "admin_support_preview " << admin(connection, SDP_ADMIN_SUPPORT_PREVIEW) << '\n';
+    std::cout << "admin_support_created " << admin(connection, SDP_ADMIN_SUPPORT_CREATE,
+        R"({"target_name":"sdk_bundle"})") << '\n';
+    const auto queued = admin(connection, SDP_ADMIN_MAINTENANCE_SUBMIT,
+        R"({"action":"statistics","request_token":"00000000000000000000000000000303"})");
+    std::cout << "admin_maintenance_queued " << queued << '\n';
+    const auto job_id = job_selector("job_id", json_id(queued, "job_id"));
+    std::cout << "admin_maintenance_done " << await_job(actor, connection, job_id, "succeeded") << '\n';
+}
+
+void job_roundtrip(Handle& submitter, sdp_open_options& options)
+{
+    Password guest_password;
+    require(static_cast<bool>(std::getline(std::cin, guest_password.value)), "Missing generated Job guest credentials");
+    SqlClient actor(submitter.value);
+    Buffer features;
+    expect(sdp_get_capabilities(submitter.value, &features.value, &actor.error_), SDP_OK, actor.error_);
+    require(take(features).find("\"jobs_v1\":true") != std::string::npos, "Job capability was unavailable");
+    std::cout << "job_capabilities " << job(actor, submitter.value, SDP_JOB_CAPABILITIES) << '\n';
+    {
+        Buffer rejected;
+        expect(sdp_job_command(submitter.value, 99, text("{}"), &rejected.value, &actor.error_),
+            SDP_INVALID_ARGUMENT, actor.error_);
+        expect(sdp_job_command(submitter.value, SDP_JOB_STATUS, text(R"({"job_id":"invalid"})"),
+            &rejected.value, &actor.error_), SDP_INVALID_ARGUMENT, actor.error_);
+        require(!rejected.value.data && !actor.error_.unknown_outcome, "invalid Job payload marked uncertain");
+    }
+    constexpr auto submit = R"({"kind":"compute","count":500000,"request_token":"00000000000000000000000000000601"})"sv;
+    const auto queued = job(actor, submitter.value, SDP_JOB_SUBMIT, submit);
+    const auto queued_selector = job_selector("job_id", json_id(queued, "job_id"));
+    std::cout << "job_queued " << queued << '\n';
+    expect(sdp_close(submitter.value, &actor.error_), SDP_OK, actor.error_);
+    submitter.value = 0;
+
+    Handle resumed;
+    expect(sdp_open(&options, &resumed.value, &actor.error_), SDP_OK, actor.error_);
+    SqlClient observer(resumed.value);
+    observer.outcome("00000000000000000000000000000601", "job_ledger");
+    std::cout << "job_done " << await_job(observer, resumed.value, queued_selector, "succeeded") << '\n';
+    std::cout << "job_status " << job(observer, resumed.value, SDP_JOB_STATUS, queued_selector) << '\n';
+    std::cout << "job_replayed " << job(observer, resumed.value, SDP_JOB_SUBMIT, submit) << '\n';
+    {
+        Buffer conflict;
+        constexpr auto changed = R"({"kind":"compute","count":2,"request_token":"00000000000000000000000000000601"})"sv;
+        expect(sdp_job_command(resumed.value, SDP_JOB_SUBMIT, text(changed), &conflict.value, &observer.error_),
+            SDP_INVALID_STATE, observer.error_);
+        require(!conflict.value.data, "different input reused a committed Job token");
+    }
+
+    const auto durable_before = history(observer, resumed.value, SDP_HISTORY_STATUS);
+    expect(sdp_tx_begin(resumed.value, &observer.error_), SDP_OK, observer.error_);
+    constexpr auto rollback_job = R"({"kind":"compute","count":19,"request_token":"00000000000000000000000000000606"})"sv;
+    const auto staged = job(observer, resumed.value, SDP_JOB_SUBMIT, rollback_job);
+    require(staged.find("\"lsn\"") == staged.npos, "Uncommitted Job submit returned a durable revision");
+    expect(sdp_tx_rollback(resumed.value, &observer.error_), SDP_OK, observer.error_);
+    require(history(observer, resumed.value, SDP_HISTORY_STATUS) == durable_before,
+        "Rolled back Job submit published a History revision");
+    {
+        Buffer withdrawn;
+        const auto selector = job_selector("job_id", json_id(staged, "job_id"));
+        expect(sdp_job_command(resumed.value, SDP_JOB_STATUS, text(selector), &withdrawn.value, &observer.error_),
+            SDP_PERMISSION_DENIED, observer.error_);
+    }
+    observer.outcome("00000000000000000000000000000606", "job_withdrawn");
+
+    observer.write("CREATE USER job_guest", "00000000000000000000000000000607");
+    expect(sdp_password_set(resumed.value, text("job_guest"), {}, text(guest_password.value),
+        text("00000000000000000000000000000608"), &observer.error_), SDP_OK, observer.error_);
+    {
+        auto guest_options = options;
+        guest_options.username = text("job_guest");
+        guest_options.password = text(guest_password.value);
+        Handle guest;
+        expect(sdp_open(&guest_options, &guest.value, &observer.error_), SDP_OK, observer.error_);
+        guest_password.clear();
+        for (const auto operation : {SDP_JOB_STATUS, SDP_JOB_WATCH, SDP_JOB_CANCEL})
+        {
+            Buffer denied;
+            expect(sdp_job_command(guest.value, operation, text(queued_selector), &denied.value, &observer.error_),
+                SDP_PERMISSION_DENIED, observer.error_);
+            require(!denied.value.data, "unauthorized Job operation returned output");
+        }
+    }
+
+    constexpr auto cancel_job = R"({"kind":"compute","count":500000000,"request_token":"00000000000000000000000000000602"})"sv;
+    const auto waiting = job(observer, resumed.value, SDP_JOB_SUBMIT, cancel_job);
+    const auto cancel_selector = job_selector("job_id", json_id(waiting, "job_id"));
+    std::string progress;
+    const auto progress_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    do
+    {
+        progress = job(observer, resumed.value, SDP_JOB_WATCH, cancel_selector);
+        if (progress.find("\"progress\":{") != progress.npos) break;
+        Sleep(10);
+    } while (std::chrono::steady_clock::now() < progress_deadline);
+    require(progress.find("\"progress\":{") != progress.npos, "Job worker did not report progress");
+    std::cout << "job_progress " << progress << '\n';
+    std::cout << "job_cancel_request " << job(observer, resumed.value, SDP_JOB_CANCEL, cancel_selector) << '\n';
+    std::cout << "job_cancelled " << await_job(observer, resumed.value, cancel_selector, "cancelled") << '\n';
+
+    constexpr auto create_schedule = R"({"kind":"compute","count":300,"rule":{"every_seconds":1},"misfire":"run_once","retries":1,"backoff_seconds":1,"request_token":"00000000000000000000000000000603"})"sv;
+    const auto schedule = job(observer, resumed.value, SDP_JOB_SCHEDULE_CREATE, create_schedule);
+    const auto schedule_selector = job_selector("schedule_id", json_id(schedule, "schedule_id"));
+    std::cout << "job_schedule " << schedule << '\n';
+    auto observation = schedule;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (observation.find("\"last_job_id\":\"") == observation.npos && std::chrono::steady_clock::now() < deadline)
+    {
+        Sleep(50);
+        observation = job(observer, resumed.value, SDP_JOB_SCHEDULE_STATUS, schedule_selector);
+    }
+    const auto scheduled = job_selector("job_id", json_id(observation, "last_job_id"));
+    std::cout << "job_schedule_observed " << observation << '\n';
+    std::cout << "job_schedule_done " << await_job(observer, resumed.value, scheduled, "succeeded") << '\n';
+    std::cout << "job_schedule_cancelled " << job(observer, resumed.value, SDP_JOB_SCHEDULE_CANCEL, schedule_selector) << '\n';
+}
+
 int use_package(int argc, char** argv)
 {
     require(argc == 4, "Usage: sdp_native_consumer mode port ca-file");
     const std::string_view mode(argv[1]);
-    require(sdp_abi_version() == SDP_ABI_VERSION && sdp_library_version() == 0x00000200u,
+    require(sdp_abi_version() == SDP_ABI_VERSION && sdp_library_version() == 0x00000300u,
         "library or ABI version mismatch");
 
     Password password;
@@ -880,7 +1320,7 @@ int use_package(int argc, char** argv)
     options.username = text("local-admin");
     options.password = text(password.value);
     options.port = port_from(argv[2]);
-    options.timeout_ms = mode == "handshake_timeout" ? 900 : mode == "debugger" ? 12000 : 3500;
+    options.timeout_ms = mode == "handshake_timeout" ? 900 : (mode == "debugger" || mode == "jobs" || mode == "backup" || mode == "admin") ? 12000 : 3500;
 
     Handle connection;
     sdp_error error{};
@@ -893,7 +1333,7 @@ int use_package(int argc, char** argv)
     }
 
     const auto status = sdp_open(&options, &connection.value, &error);
-    if (mode != "debugger" && mode != "restore") password.clear();
+    if (mode != "debugger" && mode != "restore" && mode != "jobs") password.clear();
     if (mode == "tls_name" || mode == "tls_untrusted" || mode == "handshake_timeout" || mode == "auth_reject")
     {
         sdp_status expected = SDP_TLS_FAILED;
@@ -904,6 +1344,36 @@ int use_package(int argc, char** argv)
         return 0;
     }
     expect(status, SDP_OK, error);
+
+    if (mode == "admin")
+    {
+        admin_roundtrip(connection.value);
+        return 0;
+    }
+
+    if (mode == "backup")
+    {
+        backup_roundtrip(connection.value);
+        return 0;
+    }
+
+    if (mode == "ml")
+    {
+        ml_roundtrip(connection.value);
+        return 0;
+    }
+
+    if (mode == "jobs")
+    {
+        job_roundtrip(connection, options);
+        return 0;
+    }
+
+    if (mode == "decision")
+    {
+        decision_roundtrip(connection.value);
+        return 0;
+    }
 
     if (mode == "restore")
     {

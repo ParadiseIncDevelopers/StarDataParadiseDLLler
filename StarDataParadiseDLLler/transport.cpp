@@ -104,6 +104,29 @@ RemoteError decode_remote_error(const Json& error, std::string_view session, uin
     }
     if (result.code == SDP_INTERNAL_ERROR && history_reason != error.end() && *history_reason == "history_integrity")
         copy_text(result.message, "Historical integrity verification failed (history_integrity)");
+    const auto decision_reason = error.find("decision_reason");
+    if (decision_reason != error.end() && decision_reason->is_string())
+    {
+        static constexpr struct
+        {
+            sdp_status code;
+            std::string_view reason;
+            std::string_view message;
+        } reasons[] = {
+            {SDP_PERMISSION_DENIED, "denied", "Decision denied the proposed write (denied)"},
+            {SDP_PERMISSION_DENIED, "unknown", "Decision condition was UNKNOWN (unknown)"},
+            {SDP_MODULE_UNAVAILABLE, "module_unavailable", "Decision runtime is unavailable (module_unavailable)"},
+            {SDP_INVALID_STATE, "policy_unavailable", "Decision policy is unavailable (policy_unavailable)"},
+            {SDP_INVALID_STATE, "dependency_snapshot_unavailable", "Decision dependency snapshot is unavailable (dependency_snapshot_unavailable)"},
+            {SDP_INVALID_STATE, "history_image_changed", "Decision would change the restored row image (history_image_changed)"},
+        };
+        for (const auto& entry : reasons)
+            if (entry.code == result.code && decision_reason->get_ref<const std::string&>() == entry.reason)
+            {
+                copy_text(result.message, entry.message);
+                break;
+            }
+    }
     const auto& correlation = error.at("correlation_id");
     if (correlation.is_string() && !session.empty() &&
         correlation == std::string(session) + "-" + std::to_string(id))
@@ -200,7 +223,7 @@ asio::awaitable<std::string> Transport::connect(const Endpoint& endpoint, std::s
     check(error, true);
 
     const auto hello = co_await exchange(wire::request(next_id_++, "hello",
-        Json{{"client", "StarDataParadiseDLLler/0.2.0"}}), deadline);
+        Json{{"client", "StarDataParadiseDLLler/0.3.0"}}), deadline);
     session_ = wire::string_field(hello, "session_id");
     const auto protocol = hello.find("protocol_version");
     if (!hex_id(session_) || protocol == hello.end() || !protocol->is_number_integer() || *protocol != wire::version)

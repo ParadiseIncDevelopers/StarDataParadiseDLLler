@@ -76,7 +76,7 @@ def read_line(process, timeout=10):
 
 
 @contextmanager
-def server_instance(server, root, password, *, initialize=False, restart=False, routine_test=False):
+def server_instance(server, root, password, *, initialize=False, restart=False, routine_test=False, backup=False):
     path = root / "server.json"
     command = [server, "--config", str(path)]
     if not restart:
@@ -87,6 +87,10 @@ def server_instance(server, root, password, *, initialize=False, restart=False, 
                       port=0, timeout_ms=10000, max_connections=16)
         if routine_test:
             config["routine_test_instance"] = True
+        if backup:
+            (root / "archives").mkdir()
+            config["backup"] = "archives"
+
         path.write_text(json.dumps(config), encoding="ascii")
         run([*command, "--bootstrap-admin", "local-admin"], input=(password + "\n") * 2, timeout=10)
         if initialize:
@@ -455,6 +459,211 @@ def test_restore_consumer(args, consumer, root, password):
     print("history_native_restore_stale_replay_and_field_revert passed", flush=True)
 
 
+def test_decision_consumer(args, consumer, root, password):
+    fixture = root / "decision"
+    fixture.mkdir()
+    certificates(args.openssl, fixture)
+    with server_instance(args.server, fixture, password, initialize=True) as port:
+        output = run([consumer, "decision", str(port), str(fixture / "ca.pem")],
+                     input=password + "\n", timeout=40)
+        seen = sql_evidence(output, "decision")
+    require(seen["decision_validate"] == [{"valid": True}], "Decision validation did not confirm the rule")
+    created = seen["decision_created"][0]["lsn"]
+    appended = seen["decision_appended"][0]["lsn"]
+    activated = seen["decision_activated"][0]["lsn"]
+    require(int(created) < int(appended) < int(activated) and
+            seen["decision_ledger"] == [{"status": "committed", "lsn": created}],
+            "Decision creation/activation did not publish the expected revision and request outcome")
+    for label in ("decision_why", "decision_whatif", "decision_recheck", "decision_historical"):
+        inspection = seen[label][0]
+        require(inspection["allowed"] is False and inspection["rules"] and inspection["computed"] == {},
+                f"{label} did not explain its failing rule without computed values")
+    require(seen["decision_historical"][0]["revision"] == created,
+            "historical explanation did not use the requested revision")
+
+    comparison = seen["decision_test"][0]
+    [changed, unchanged] = comparison["cases"]
+    require(comparison["changed"] == 1 and
+            not changed["prior"]["allowed"] and changed["candidate"]["allowed"] and
+            unchanged["prior"]["allowed"] and unchanged["candidate"]["allowed"],
+            "Decision impact report ignored a threshold change or changed unaffected results")
+    require(seen["decision_now"][0]["revision"] == activated and seen["decision_now"][0]["allowed"] is True,
+            "new rule did not take effect atomically after activation")
+    require(result_rows(seen["decision_before"]) == [] and result_rows(seen["decision_after"]) == [
+        [{"t": "i64", "v": "2"}, {"t": "i64", "v": "3"}],
+    ], "Decision simulation wrote rows or the activated rule did not permit the actual insert")
+    print("decision_native_validate_explain_whatif_impact_recheck_and_activate passed", flush=True)
+
+
+def compute_checksum(count):
+    mask = (1 << 64) - 1
+    checksum = 0x9E3779B97F4A7C15
+    for number in range(1, count + 1):
+        checksum ^= (number + 0x9E3779B97F4A7C15) & mask
+        checksum = ((checksum ^ (checksum >> 30)) * 0xBF58476D1CE4E5B9) & mask
+        checksum = ((checksum ^ (checksum >> 27)) * 0x94D049BB133111EB) & mask
+        checksum ^= checksum >> 31
+    return str(checksum)
+
+
+def test_jobs_consumer(args, consumer, root, password):
+    fixture = root / "jobs"
+    fixture.mkdir()
+    certificates(args.openssl, fixture)
+    guest_password = secrets.token_urlsafe(32)
+    with server_instance(args.server, fixture, password, initialize=True) as port:
+        output = run([consumer, "jobs", str(port), str(fixture / "ca.pem")],
+                     input=f"{password}\n{guest_password}\n", timeout=45)
+        seen = sql_evidence(output, "jobs")
+    limits = seen["job_capabilities"][0]
+    require("compute" in limits["kinds"] and limits["maximum_workers"] == 1 and limits["hard_memory_limit"],
+            "Native Jobs capabilities did not report the actual isolated worker budgets")
+    queued, done, status = (seen[label][0] for label in ("job_queued", "job_done", "job_status"))
+    require(queued["state"] == "queued" and queued["result"] is None and
+            seen["job_ledger"] == [{"status": "committed", "lsn": queued["lsn"]}],
+            "Job submission did not commit the queued job and durable outcome together")
+    replayed = seen["job_replayed"][0]
+    require(replayed["job_id"] == queued["job_id"] and replayed["lsn"] == queued["lsn"]
+            and seen["job_withdrawn"] == [{"status": "unknown"}],
+            "Native retry changed the job identity or rolled back submission left an outcome")
+    require(queued["job_id"] == done["job_id"] == status["job_id"] and done["state"] == status["state"] == "succeeded"
+            and done["attempt"] == 1 and done["result"] == {"count": 500000, "checksum": compute_checksum(500000)}
+            and [event["state"] for event in done["events"]] == ["queued", "starting", "running", "succeeded"],
+            "reconnected SDK did not observe the same completed job and independently checked result")
+
+    progress, requested, cancelled = (seen[label][0] for label in ("job_progress", "job_cancel_request", "job_cancelled"))
+    require(progress["state"] == "running" and progress["worker_pid"] > 0 and
+            progress["progress"]["total"] == 500000000 and 0 <= progress["progress"]["done"] <= 500000000 and
+            requested["cancel_requested"] and cancelled["state"] == "cancelled" and cancelled["result"] is None and
+            progress["job_id"] == requested["job_id"] == cancelled["job_id"],
+            "Native progress or cancellation did not reflect the running worker lifecycle")
+    schedule, observed, scheduled, stopped = (
+        seen[label][0] for label in ("job_schedule", "job_schedule_observed", "job_schedule_done", "job_schedule_cancelled")
+    )
+    require(schedule["schedule_id"] == observed["schedule_id"] == stopped["schedule_id"] and schedule["enabled"]
+            and observed["last_job_id"] == scheduled["job_id"] and scheduled["state"] == "succeeded"
+            and scheduled["result"] == {"count": 300, "checksum": compute_checksum(300)} and not stopped["enabled"],
+            "the durable schedule did not launch, expose and disable the expected controlled job")
+    logs = b"".join(path.read_bytes() for path in fixture.rglob("*.log"))
+    require(guest_password.encode("ascii") not in logs, "Job fixture credential leaked")
+    print("jobs_native_submit_reconnect_progress_cancel_schedule_rollback_and_owner_guard passed", flush=True)
+
+
+def test_ml_consumer(args, consumer, root, password):
+    fixture = root / "ml"
+    fixture.mkdir()
+    certificates(args.openssl, fixture)
+    with server_instance(args.server, fixture, password, initialize=True) as port:
+        output = run([consumer, "ml", str(port), str(fixture / "ca.pem")],
+                     input=password + "\n", timeout=45)
+    seen = sql_evidence(output, "ml")
+    devices = seen["ml_devices"][0]
+    require(devices["cpu_available"] and isinstance(devices["devices"], list) and
+            (not devices["gpu_available"] or devices["gpu_verified"]),
+            "Native ML device report did not distinguish CPU and verified GPU")
+    dataset = seen["ml_dataset"][0]
+    materialized = seen["ml_materialized"][0]
+    require(dataset["row_count"] == 10 and dataset["dataset_id"] == materialized["dataset_id"] and
+            materialized["prepared"]["split"] == {"train": list(range(6)), "validation": [6, 7], "test": [8, 9]},
+            "Native dataset did not preserve the predictable split")
+    created, queued, done, status, evaluation = (seen[label][0] for label in
+        ("ml_model", "ml_train", "ml_trained", "ml_status", "ml_evaluate"))
+    require(created["active_version"] is None and created["versions"] == [] and
+            queued["state"] == "queued" and done["state"] == "succeeded" and
+            queued["job_id"] == done["job_id"] == evaluation["run_id"] and
+            evaluation["dataset_id"] == dataset["dataset_id"] and
+            status["versions"][0]["checksum"] == evaluation["checksum"],
+            "Native model training did not publish the expected dataset-bound artifact")
+    require(abs(seen["ml_predict"][0]["prediction"] - 40.0) < 1e-9 and
+            seen["ml_activate"][0]["active_version"] == seen["ml_rollback"][0]["active_version"] == 1 and
+            seen["ml_activate_second"][0]["active_version"] == 2 and
+            seen["ml_compare"][0]["comparable"] and
+            [item["version"] for item in seen["ml_compare"][0]["runs"]] == [1, 2] and
+            seen["ml_delete_second"][0]["deleted"] and
+            seen["ml_deactivate"][0]["active_version"] is None and
+            seen["ml_deactivate_again"][0]["active_version"] is None and
+            seen["ml_delete"][0]["deleted"] and seen["ml_status_after_delete"][0]["versions"] == [],
+            "Native model prediction and version lifecycle returned unexpected results")
+    print("native_ml_dataset_train_evaluate_activate_predict_rollback_delete passed", flush=True)
+
+def test_backup_consumer(args, consumer, root, password):
+    fixture = root / "backup"
+    fixture.mkdir()
+    certificates(args.openssl, fixture)
+    with server_instance(args.server, fixture, password, initialize=True, backup=True) as port:
+        output = run([consumer, "backup", str(port), str(fixture / "ca.pem")],
+                     input=password + "\n", timeout=60)
+    seen = sql_evidence(output, "backup")
+    queued, complete, status = (seen[label][0] for label in
+        ("backup_queued", "backup_complete", "backup_status"))
+    require(queued["state"] == "queued" and complete["state"] == status["state"] == "succeeded" and
+            queued["job_id"] == complete["job_id"] == status["job_id"] and complete["result"] == status["result"],
+            "Native backup did not expose the same completed durable job")
+    catalog, verified, restored, deleted, final_catalog = (seen[label][0] for label in
+        ("backup_catalog", "backup_verified", "backup_restored", "backup_deleted", "backup_final_catalog"))
+    backup_id = complete["result"]["backup_id"]
+    require(catalog["pitr"] is False and len(catalog["backups"]) == 1 and
+            catalog["backups"][0]["backup_id"] == verified["backup_id"] == restored["backup_id"] ==
+            deleted["backup_id"] == backup_id and verified["verified"] and restored["restored"] and
+            restored["target_name"] == "sdk_copy" and deleted["deleted"] and final_catalog["backups"] == [],
+            "Native backup catalog, verified restore or retention differed from the archive job")
+    require(catalog["backups"][0]["manifest_sha256"] == verified["manifest_sha256"] == restored["manifest_sha256"],
+            "Native restore referenced a different archive manifest")
+    scheduled, stopped, occurrence = (seen[label][0] for label in
+        ("backup_schedule", "backup_schedule_cancelled", "backup_scheduled_result"))
+    require(scheduled["enabled"] and not stopped["enabled"] and
+            scheduled["schedule_id"] == stopped["schedule_id"] and
+            occurrence["state"] == "succeeded" and occurrence["result"]["verified"] and
+            occurrence["result"]["backup_id"] != backup_id,
+            "Native backup schedule failed to publish a distinct verified archive")
+    target = fixture / "temp" / "restores" / restored["target_name"]
+    require((target / "store.sdp").is_file() and not (target / "admin-v1.json").exists() and
+            not (target / "server.key").exists(),
+            "Native restore did not produce separate storage with only archive data")
+    print("native_backup_submit_status_catalog_verify_restore_delete_and_schedule passed", flush=True)
+
+def test_admin_consumer(args, consumer, root, password):
+    fixture = root / "admin"
+    fixture.mkdir()
+    certificates(args.openssl, fixture)
+    with server_instance(args.server, fixture, password, initialize=True) as port:
+        output = run([consumer, "admin", str(port), str(fixture / "ca.pem")],
+                     input=password + "\n", timeout=60)
+    seen = sql_evidence(output, "admin")
+    status, before, storage, after = (seen[label][0] for label in
+        ("admin_status", "admin_health_before", "admin_storage", "admin_health_after"))
+    require(status["instance_id"] == before["instance_id"] == after["instance_id"] and
+            status["port"] == port and len(status["sessions"]) >= 1 and isinstance(status["limits"], dict),
+            "Native instance status did not report the live listener and its limits")
+    require(before["checks"]["storage"]["status"] == "UNKNOWN" and
+            before["checks"]["storage"]["checked_at"] is None and storage["check"] == "storage" and
+            storage["result"]["status"] == "OK" and isinstance(storage["result"]["checked_at"], int) and
+            after["checks"]["storage"] == storage["result"],
+            "Native Health status did not update from a measured storage check")
+    preview, applied = (seen[label][0] for label in ("admin_config_preview", "admin_config_applied"))
+    require(preview["valid"] and not preview["applied"] and preview["dynamic"]["timeout_ms"] == 8500 and
+            preview["restart_required"] == {"port": 13393, "max_connections": 12} and
+            applied["applied"] and applied["dynamic"]["timeout_ms"] == 8500 and not applied["restart_required"],
+            "Native configuration preview and apply did not separate dynamic and restart fields")
+    config_file = json.loads((fixture / "server.json").read_text(encoding="utf-8"))
+    prior_name = applied["previous_config"]
+    require(Path(prior_name).name == prior_name, "Native apply returned a non-local previous config name")
+    previous = json.loads((fixture / prior_name).read_text(encoding="utf-8"))
+    require(config_file == {**previous, "timeout_ms": 8500} and previous["timeout_ms"] == 10000,
+            "Native configuration apply persisted unrelated changes")
+    preview, created = (seen[label][0] for label in ("admin_support_preview", "admin_support_created"))
+    filename = fixture / "temp" / "support" / "sdk_bundle" / "bundle.json"
+    content = filename.read_text(encoding="utf-8")
+    require(preview["secret_scan_passed"] and created["secret_scan_passed"] and
+            created["target_name"] == "sdk_bundle" and password not in content and
+            "tls_private_key" not in json.loads(content)["config"],
+            "Native support bundle was not redacted and scanned")
+    queued, done = (seen[label][0] for label in ("admin_maintenance_queued", "admin_maintenance_done"))
+    require(queued["state"] == "queued" and queued["job_id"] == done["job_id"] and
+            done["state"] == "succeeded" and done["result"] is not None,
+            "Native maintenance submission did not complete through the shared job API")
+    print("native_admin_status_health_config_support_and_maintenance passed", flush=True)
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", required=True, type=Path)
@@ -469,6 +678,11 @@ def main():
     parser.add_argument("--debugger", action="store_true", help="exercise two-connection routine debugger and rollback fixture")
     parser.add_argument("--history", action="store_true", help="exercise History through the installed Native SDK")
     parser.add_argument("--restore", action="store_true", help="exercise History restore, revert and outcome replay")
+    parser.add_argument("--decision", action="store_true", help="exercise Decision policy and simulations through the installed Native SDK")
+    parser.add_argument("--jobs", action="store_true", help="exercise durable Jobs, progress, cancellation and scheduling")
+    parser.add_argument("--ml", action="store_true", help="exercise dataset and model operations through the installed SDK")
+    parser.add_argument("--backup", action="store_true", help="exercise backup jobs and isolated restore through the installed SDK")
+    parser.add_argument("--admin", action="store_true", help="exercise instance health, configuration, support and maintenance via the installed SDK")
     args = parser.parse_args()
     args.server = str(args.server.resolve(strict=True))
     args.openssl = str(args.openssl.resolve(strict=True))
@@ -515,6 +729,21 @@ def main():
 
         if args.restore:
             test_restore_consumer(args, consumer, root, password)
+
+        if args.decision:
+            test_decision_consumer(args, consumer, root, password)
+
+        if args.jobs:
+            test_jobs_consumer(args, consumer, root, password)
+
+        if args.ml:
+            test_ml_consumer(args, consumer, root, password)
+
+        if args.backup:
+            test_backup_consumer(args, consumer, root, password)
+
+        if args.admin:
+            test_admin_consumer(args, consumer, root, password)
 
         logs = b"".join(path.read_bytes() for path in root.rglob("*.log"))
         require(password.encode("ascii") not in logs and incorrect.encode("ascii") not in logs,
