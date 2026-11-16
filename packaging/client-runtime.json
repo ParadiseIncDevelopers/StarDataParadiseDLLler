@@ -1,0 +1,10 @@
+{
+  "id": "stardataparadise-native",
+  "version": "0.4.1",
+  "platform": "windows",
+  "architecture": "x64",
+  "archiveSha256": "8073941b68c6c037ea646d4cc3f2bcc31445462356c9bd0db513b35cc2378041",
+  "runtime": "bin/StarDataParadiseDLLler.dll",
+  "destination": "StarDataParadiseDLLler.dll",
+  "abi": 1
+}

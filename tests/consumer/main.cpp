@@ -970,17 +970,18 @@ std::string await_job(SqlClient& actor, sdp_connection connection, std::string_v
 {
     const auto wanted = "\"state\":\"" + std::string(final_state) + "\"";
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    std::string status;
     do
     {
-        auto status = job(actor, connection, SDP_JOB_WATCH, selector);
+        status = job(actor, connection, SDP_JOB_WATCH, selector);
         if (status.find(wanted) != status.npos) return status;
         if (status.find("\"state\":\"failed\"") != status.npos ||
             status.find("\"state\":\"succeeded\"") != status.npos ||
             status.find("\"state\":\"cancelled\"") != status.npos)
-            throw std::runtime_error("Job entered an unexpected terminal state");
+            throw std::runtime_error("Job entered an unexpected terminal state: " + status);
         Sleep(30);
     } while (std::chrono::steady_clock::now() < deadline);
-    throw std::runtime_error("Job did not enter its final state within the fixture bound");
+    throw std::runtime_error("Job did not enter its final state within the fixture bound: " + status);
 }
 
 std::string dataset(sdp_connection connection, sdp_dataset_operation operation, std::string_view input)
@@ -997,6 +998,28 @@ std::string model(sdp_connection connection, sdp_model_operation operation, std:
     sdp_error error{};
     expect(sdp_model_command(connection, operation, text(input), &output.value, &error), SDP_OK, error);
     return take(output);
+}
+
+std::string linear_model_fixture(SqlClient& actor, sdp_connection connection)
+{
+    actor.write("CREATE TABLE sdk_ml (x BIGINT PRIMARY KEY, y BIGINT)", "00000000000000000000000000000201");
+    actor.write(R"(INSERT INTO sdk_ml VALUES (0,4),(1,7),(2,10),(3,13),(4,16),
+        (5,19),(6,22),(7,25),(8,28),(9,31))", "00000000000000000000000000000202");
+    const auto created = dataset(connection, SDP_DATASET_CREATE, R"({
+        "request_token":"00000000000000000000000000000203",
+        "sql":"SELECT x,y FROM sdk_ml ORDER BY x",
+        "options":{
+            "features":[{"column":"x","transform":"numeric","impute":"reject"}],
+            "target":"y","split":{"mode":"time","time":"x","train":60,"validation":20}
+        }
+    })");
+    const auto dataset_id = json_id(created, "dataset_id");
+    std::cout << "ml_dataset " << created << '\n';
+    std::cout << "ml_materialized " << dataset(connection, SDP_DATASET_GET, job_selector("dataset_id", dataset_id)) << '\n';
+
+    std::cout << "ml_model " << model(connection, SDP_MODEL_CREATE,
+        R"({"name":"sdk_model","algorithm":"linear","request_token":"00000000000000000000000000000204"})") << '\n';
+    return dataset_id;
 }
 
 void ml_roundtrip(sdp_connection connection)
@@ -1017,23 +1040,7 @@ void ml_roundtrip(sdp_connection connection)
     }
     const auto devices = model(connection, SDP_MODEL_DEVICES, R"({"device_index":0,"memory_mib":128})");
     std::cout << "ml_devices " << devices << '\n';
-    actor.write("CREATE TABLE sdk_ml (x BIGINT PRIMARY KEY, y BIGINT)", "00000000000000000000000000000201");
-    actor.write(R"(INSERT INTO sdk_ml VALUES (0,4),(1,7),(2,10),(3,13),(4,16),
-        (5,19),(6,22),(7,25),(8,28),(9,31))", "00000000000000000000000000000202");
-    const auto created = dataset(connection, SDP_DATASET_CREATE, R"({
-        "request_token":"00000000000000000000000000000203",
-        "sql":"SELECT x,y FROM sdk_ml ORDER BY x",
-        "options":{
-            "features":[{"column":"x","transform":"numeric","impute":"reject"}],
-            "target":"y","split":{"mode":"time","time":"x","train":60,"validation":20}
-        }
-    })");
-    const auto dataset_id = json_id(created, "dataset_id");
-    std::cout << "ml_dataset " << created << '\n';
-    std::cout << "ml_materialized " << dataset(connection, SDP_DATASET_GET, job_selector("dataset_id", dataset_id)) << '\n';
-
-    std::cout << "ml_model " << model(connection, SDP_MODEL_CREATE,
-        R"({"name":"sdk_model","algorithm":"linear","request_token":"00000000000000000000000000000204"})") << '\n';
+    const auto dataset_id = linear_model_fixture(actor, connection);
     const auto train = model(connection, SDP_MODEL_TRAIN,
         "{\"name\":\"sdk_model\",\"dataset_id\":\"" + dataset_id +
         "\",\"seed\":87,\"request_token\":\"00000000000000000000000000000205\"}");
@@ -1081,6 +1088,80 @@ void ml_roundtrip(sdp_connection connection)
     std::cout << "ml_delete " << model(connection, SDP_MODEL_DELETE,
         R"({"name":"sdk_model","version":1,"request_token":"00000000000000000000000000000210"})") << '\n';
     std::cout << "ml_status_after_delete " << model(connection, SDP_MODEL_STATUS, R"({"name":"sdk_model"})") << '\n';
+}
+
+std::string dispatch_and_disable(SqlClient& observer, sdp_connection connection, const std::string& identity)
+{
+    const auto selector = job_selector("schedule_id", identity);
+    const auto deadline = std::chrono::steady_clock::now() + 12s;
+    do
+    {
+        const auto observation = job(observer, connection, SDP_JOB_SCHEDULE_STATUS, selector);
+        if (observation.find("\"last_job_id\":\"") != observation.npos)
+        {
+            const auto disabled = job(observer, connection, SDP_JOB_SCHEDULE_CANCEL, selector);
+            require(disabled.find("\"enabled\":false") != disabled.npos, "Native recipe schedule remained enabled");
+            return job_selector("job_id", json_id(observation, "last_job_id"));
+        }
+        Sleep(30);
+    } while (std::chrono::steady_clock::now() < deadline);
+    throw std::runtime_error("Native recipe schedule did not dispatch within the fixture bound");
+}
+
+void scheduled_recipe_roundtrip(Handle& original, const sdp_open_options& options)
+{
+    SqlClient actor(original.value);
+    Buffer capabilities;
+    expect(sdp_get_capabilities(original.value, &capabilities.value, &actor.error_), SDP_OK, actor.error_);
+    const auto features = take(capabilities);
+    require(features.find("\"scheduled_sql_v1\":true") != features.npos &&
+        features.find("\"scheduled_retrain_v1\":true") != features.npos,
+        "Native discovery did not advertise both scheduled recipe capabilities");
+    std::cout << "recipe_capabilities " << job(actor, original.value, SDP_JOB_CAPABILITIES) << '\n';
+    const auto dataset_id = linear_model_fixture(actor, original.value);
+    const auto first = model(original.value, SDP_MODEL_TRAIN,
+        "{\"name\":\"sdk_model\",\"dataset_id\":\"" + dataset_id +
+        "\",\"request_token\":\"00000000000000000000000000000701\"}");
+    std::cout << "recipe_initial_training " <<
+        await_job(actor, original.value, job_selector("job_id", json_id(first, "job_id")), "succeeded") << '\n';
+    std::cout << "recipe_initial_activation " << model(original.value, SDP_MODEL_ACTIVATE,
+        R"({"name":"sdk_model","version":1,"request_token":"00000000000000000000000000000702"})") << '\n';
+    actor.write("CREATE TABLE sdk_script (id BIGINT PRIMARY KEY, value BIGINT)", "00000000000000000000000000000703");
+
+    constexpr auto script = R"json({
+        "kind":"sql_script",
+        "sql":["INSERT INTO sdk_script VALUES(1,4)","UPDATE sdk_script SET value=7 WHERE id=1"],
+        "rule":{"every_seconds":3},
+        "request_token":"00000000000000000000000000000704"
+    })json"sv;
+    const auto retrain = "{\"kind\":\"retrain\",\"name\":\"sdk_model\",\"dataset_id\":\"" + dataset_id +
+        "\",\"seed\":87,\"options\":{},\"rule\":{\"every_seconds\":3},\"request_token\":\"00000000000000000000000000000705\"}";
+    const auto sql_schedule = job(actor, original.value, SDP_JOB_SCHEDULE_CREATE, script);
+    std::cout << "recipe_sql_schedule " << sql_schedule << '\n';
+    const auto retrain_schedule = job(actor, original.value, SDP_JOB_SCHEDULE_CREATE, retrain);
+    std::cout << "recipe_model_schedule " << retrain_schedule << '\n';
+    const auto script_id = json_id(sql_schedule, "schedule_id");
+    const auto retrain_id = json_id(retrain_schedule, "schedule_id");
+    require(script_id == json_id(job(actor, original.value, SDP_JOB_SCHEDULE_CREATE, script), "schedule_id") &&
+        retrain_id == json_id(job(actor, original.value, SDP_JOB_SCHEDULE_CREATE, retrain), "schedule_id"),
+        "replaying a Native recipe change allocated a second schedule");
+
+    expect(sdp_close(original.value, &actor.error_), SDP_OK, actor.error_);
+    original.value = 0;
+    Handle reopened;
+    expect(sdp_open(&options, &reopened.value, &actor.error_), SDP_OK, actor.error_);
+    SqlClient observer(reopened.value);
+    const auto script_job = dispatch_and_disable(observer, reopened.value, script_id);
+    const auto model_job = dispatch_and_disable(observer, reopened.value, retrain_id);
+    require(script_job != model_job, "Different Native recipes dispatched the same job");
+    std::cout << "recipe_sql_job " << await_job(observer, reopened.value, script_job, "succeeded") << '\n';
+    std::cout << "recipe_model_job " << await_job(observer, reopened.value, model_job, "succeeded") << '\n';
+    const auto select = observer.prepare("SELECT id,value FROM sdk_script ORDER BY id");
+    observer.fetch(json_id(observer.execute(select)), 10, "recipe_sql_rows");
+    observer.close(select);
+    std::cout << "recipe_model_status " << model(reopened.value, SDP_MODEL_STATUS, R"({"name":"sdk_model"})") << '\n';
+    std::cout << "recipe_model_evaluation " << model(reopened.value, SDP_MODEL_EVALUATE,
+        R"({"name":"sdk_model","version":2})") << '\n';
 }
 
 std::string backup(sdp_connection connection, sdp_backup_operation operation, std::string_view input = "{}")
@@ -1402,7 +1483,7 @@ int use_package(int argc, char** argv)
 {
     require(argc == 4, "Usage: sdp_native_consumer mode port ca-file");
     const std::string_view mode(argv[1]);
-    require(sdp_abi_version() == SDP_ABI_VERSION && sdp_library_version() == 0x00000400u,
+    require(sdp_abi_version() == SDP_ABI_VERSION && sdp_library_version() == 0x00000401u,
         "library or ABI version mismatch");
 
     Password password;
@@ -1438,7 +1519,8 @@ int use_package(int argc, char** argv)
     }
 
     const auto status = sdp_open(&options, &connection.value, &error);
-    if (mode != "debugger" && mode != "restore" && mode != "jobs") password.clear();
+    if (mode != "debugger" && mode != "restore" && mode != "jobs" && mode != "scheduled_recipes")
+        password.clear();
     if (mode == "tls_name" || mode == "tls_untrusted" || mode == "handshake_timeout" || mode == "auth_reject")
     {
         sdp_status expected = SDP_TLS_FAILED;
@@ -1471,6 +1553,12 @@ int use_package(int argc, char** argv)
     if (mode == "jobs")
     {
         job_roundtrip(connection, options);
+        return 0;
+    }
+
+    if (mode == "scheduled_recipes")
+    {
+        scheduled_recipe_roundtrip(connection, options);
         return 0;
     }
 

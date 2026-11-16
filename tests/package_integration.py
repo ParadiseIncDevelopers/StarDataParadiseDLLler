@@ -557,6 +557,31 @@ def test_jobs_consumer(args, consumer, root, password):
     print("jobs_native_submit_reconnect_progress_cancel_schedule_rollback_and_owner_guard passed", flush=True)
 
 
+def test_scheduled_recipes_consumer(args, consumer, root, password):
+    fixture = root / "scheduled-recipes"
+    fixture.mkdir()
+    certificates(args.openssl, fixture)
+    with server_instance(args.server, fixture, password, initialize=True) as port:
+        output = run([consumer, "scheduled_recipes", str(port), str(fixture / "ca.pem")],
+                     input=password + "\n", timeout=45)
+    seen = sql_evidence(output, "scheduled_recipes")
+    capabilities = seen["recipe_capabilities"][0]
+    require(all({"sql_script", "retrain"}.issubset(capabilities[field]) for field in ("kinds", "schedule_kinds")),
+            "Native job capabilities did not advertise both recipe kinds")
+    sql_job = seen["recipe_sql_job"][0]
+    require(sql_job["result"] == {"statements": 2, "affected_rows": 2, "selected_rows": 0} and
+            result_rows(seen["recipe_sql_rows"]) == [[{"t": "i64", "v": "1"}, {"t": "i64", "v": "7"}]],
+            "scheduled SQL did not commit both statements to the real table")
+    model_job, status, evaluation = (seen[label][0] for label in
+        ("recipe_model_job", "recipe_model_status", "recipe_model_evaluation"))
+    require(status["active_version"] == 1 and [entry["version"] for entry in status["versions"]] == [1, 2] and
+            model_job["result"]["version"] == 2 and model_job["job_id"] == evaluation["run_id"] and
+            model_job["result"]["checksum"] == evaluation["checksum"] == status["versions"][1]["checksum"] and
+            model_job["result"]["dataset_id"] == evaluation["dataset_id"] == seen["ml_dataset"][0]["dataset_id"],
+            "scheduled retraining did not publish a dataset-bound artifact while preserving the active version")
+    print("native_scheduled_sql_and_model_retrain_reconnect passed", flush=True)
+
+
 def test_ml_consumer(args, consumer, root, password):
     fixture = root / "ml"
     fixture.mkdir()
@@ -696,6 +721,7 @@ def main():
     parser.add_argument("--restore", action="store_true", help="exercise History restore, revert and outcome replay")
     parser.add_argument("--decision", action="store_true", help="exercise Decision policy and simulations through the installed Native SDK")
     parser.add_argument("--jobs", action="store_true", help="exercise durable Jobs, progress, cancellation and scheduling")
+    parser.add_argument("--scheduled-recipes", action="store_true", help="exercise scheduled SQL and retraining against a capable Server")
     parser.add_argument("--ml", action="store_true", help="exercise dataset and model operations through the installed SDK")
     parser.add_argument("--backup", action="store_true", help="exercise backup jobs and isolated restore through the installed SDK")
     parser.add_argument("--admin", action="store_true", help="exercise instance health, configuration, support and maintenance via the installed SDK")
@@ -764,6 +790,9 @@ def main():
 
         if args.jobs:
             test_jobs_consumer(args, consumer, root, password)
+
+        if args.scheduled_recipes:
+            test_scheduled_recipes_consumer(args, consumer, root, password)
 
         if args.ml:
             test_ml_consumer(args, consumer, root, password)

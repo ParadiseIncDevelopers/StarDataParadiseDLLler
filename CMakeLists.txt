@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.2)
-project(StarDataParadiseDLLler VERSION 0.4.0 LANGUAGES C CXX)
+project(StarDataParadiseDLLler VERSION 0.4.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

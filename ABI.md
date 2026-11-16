@@ -81,6 +81,11 @@ WATCH son durumla birlikte sınırlı durum olayı dizisini döndürür. Worker 
 
 `SDP_JOB_SCHEDULE_CREATE` aynı iş alanlarını, bir aralık kuralı `{"every_seconds":60}` veya günlük kural `{"timezone":"UTC","hour":9,"minute":30}` ile birlikte alır. İsteğe bağlı `misfire` değeri `skip` veya `run_once` olur. `retries` ve `backoff_seconds` geçici başarısızlıklara uygulanır. STATUS ve CANCEL `schedule_id` ile çağrılır.
 
+0.4.1, aynı ABI üzerinden iki yeni kalıcı takvim tarifi kabul eder. Sunucu desteğini `SDP_JOB_CAPABILITIES` yanıtındaki `kinds` alanından kontrol et.
+
+- `kind: "sql_script"` için `sql`, 1–16 SQL ifadesi içeren dizidir. Her ifade en fazla 4096 UTF-8 baytı, dizinin toplamı en fazla 16384 ifade baytıdır. Bu tarif bind alanı almaz.
+- `kind: "retrain"` için `name` modelin SQL nitelikli adıdır ve en fazla 392 UTF-8 baytıdır. `dataset_id` 32 küçük harfli hex karakterdir. İsteğe bağlı `seed` işaretsiz 32 bit tam sayıdır. İsteğe bağlı `options`, kompakt JSON gösterimi en fazla 1024 bayt olan nesnedir.
+
 ## Veri kümeleri ve modeller
 
 `sdp_dataset_command` işlemi `sdp_dataset_operation` ile, `sdp_model_command` işlemi `sdp_model_operation` ile seçer. İstek en fazla 64 KiB UTF-8 JSON nesnesidir. Boş istek boş nesneye karşılık gelir. Başarılı yanıt `sdp_buffer_free` ile bırakılır. Sunucu, veri kümesi ve model işlemlerinde oturumun yetkilerini denetler.
@@ -115,7 +120,7 @@ SUPPORT_CREATE, 1–32 küçük ASCII harf, rakam, çizgi veya alt çizgiden olu
 Paketin SHA-256 değerini kontrol ettikten sonra ZIP'i aç ve kurulum dizinini `CMAKE_PREFIX_PATH` ile ver.
 
 ```cmake
-find_package(StarDataParadiseDLLler 0.4.0 EXACT CONFIG REQUIRED)
+find_package(StarDataParadiseDLLler 0.4.1 EXACT CONFIG REQUIRED)
 target_link_libraries(my_client PRIVATE StarDataParadise::StarDataParadiseDLLler)
 ```
 

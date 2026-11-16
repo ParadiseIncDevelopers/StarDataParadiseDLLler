@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 4.2)
 project(native_example LANGUAGES CXX)
 
-find_package(StarDataParadiseDLLler 0.4.0 EXACT CONFIG REQUIRED)
+find_package(StarDataParadiseDLLler 0.4.1 EXACT CONFIG REQUIRED)
 add_executable(native_example main.cpp)
 target_compile_features(native_example PRIVATE cxx_std_20)
 target_link_libraries(native_example PRIVATE StarDataParadise::StarDataParadiseDLLler)

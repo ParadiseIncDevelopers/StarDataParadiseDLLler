@@ -1,4 +1,4 @@
-# Native SDK 0.4.0 uyumluluk matrisi
+# Native SDK 0.4.1 uyumluluk matrisi
 
 | Server yeteneği | Native ABI 1 çağrıları | Wire v1 |
 | --- | --- | --- |
@@ -20,6 +20,8 @@
 ## Paket ve yaşam döngüsü
 
 Windows x64 Release ZIP’i C ABI 1 DLL ve import library, C/C++ başlıkları, CMake import hedefi, sürümlü wire arşivi ve örnek C++ projesi taşır. Etiketli 0.3.0 DLL’in 45 dış sembolü korunur. 0.4.0’da `sdp_get_session_info` eklenir. Debug ve AddressSanitizer çıktıları ayrı dizinlerdedir ve Release paketi olarak dağıtılmaz. Kullanım için MSVC x64 dinamik çalışma zamanı gerekir. Mimari ve CMake paketi sürümü tüketici derlemesinde seçilir.
+
+0.4.1, `sdp_job_command` üzerinden `sql_script` ve `retrain` takvim tariflerini doğrular. İki tür için Sunucu desteği `SDP_JOB_CAPABILITIES` ile okunur. C ABI 1 ve wire v1 korunur.
 
 C++ sarmalayıcıları çağıran uygulamada başlık üzerinden derlenir. `Connection`, `Statement`, `Transaction` ve `Buffer` birer taşınabilir sahiplik nesnesidir. Statement ve transaction bağlantıdan önce kapatılır. Sonuç `Buffer::view()` yalnız sahibi değişene veya kapanana kadar yaşar. `Buffer::put()` önceki sonucu bırakır ve yeni C ABI çağrısı için boş çıktı işaretçisi döndürür. Connection kapatma ve sahiplik devri callback dışındaki çağıranda yapılır. Eşzamanlı kullanımda ayrı bağlantılar kullanılır. Bağlantı başına tek ağ işlemi vardır. Havuz sunulmaz. Aynı kimliğin yeniden kullanımında başarılı `sdp_session_reset` gereklidir.
 

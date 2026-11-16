@@ -14,7 +14,7 @@ CMake, bağımlılık kaynaklarını ve Server v1 sözleşmesini SHA-256 ile do�
 ## Paket tüketicisi ve tanılama
 
 ```powershell
-python tests/package_integration.py --package out/packages/StarDataParadiseDLLler-0.4.0-win-x64.zip --server <Server.exe> --openssl <openssl.exe> --scratch out/integration
+python tests/package_integration.py --package out/packages/StarDataParadiseDLLler-0.4.1-win-x64.zip --server <Server.exe> --openssl <openssl.exe> --scratch out/integration
 ```
 
 Script geçici yerel TLS sertifikaları üretir ve ayrı bir Windows instance'ı loopback üzerinde çalıştırır. Örnek tüketiciyi ZIP'ten açılan CMake paketi ile derler ve bağlantı, capability, SQL unavailable, ret, timeout, iptal, bağlantı kaybı ve kapanışı doğrular. Etap 12 Server ile `--sql` kullanıldığında ayrı bir veri deposu başlatır ve tipli CRUD, batch, savepoint, sonuç iptali, kayıp commit yanıtı ve restart sonrası outcome kontrollerini de çalıştırır.

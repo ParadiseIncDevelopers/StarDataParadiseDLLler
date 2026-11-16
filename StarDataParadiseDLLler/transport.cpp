@@ -223,7 +223,7 @@ asio::awaitable<std::string> Transport::connect(const Endpoint& endpoint, std::s
     check(error, true);
 
     const auto hello = co_await exchange(wire::request(next_id_++, "hello",
-        Json{{"client", "StarDataParadiseDLLler/0.4.0"}}), deadline);
+        Json{{"client", "StarDataParadiseDLLler/0.4.1"}}), deadline);
     session_ = wire::string_field(hello, "session_id");
     const auto protocol = hello.find("protocol_version");
     if (!hex_id(session_) || protocol == hello.end() || !protocol->is_number_integer() || *protocol != wire::version)

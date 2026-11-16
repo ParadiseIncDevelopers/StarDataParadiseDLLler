@@ -529,6 +529,22 @@ void schedule_rule(const Json& rule)
     }
 }
 
+void scheduled_sql_recipe(const Json& request)
+{
+    const auto& statements = response_field(request, "sql", Json::value_t::array);
+    if (statements.empty() || statements.size() > 16) throw Error(Code::invalid_argument);
+    size_t bytes{};
+    for (const auto& statement : statements)
+    {
+        if (!statement.is_string()) throw Error(Code::invalid_argument);
+        const auto& sql = statement.get_ref<const std::string&>();
+        if (sql.empty() || sql.size() > 4096 || sql.find('\0') != sql.npos)
+            throw Error(Code::invalid_argument);
+        bytes += sql.size();
+    }
+    if (bytes > 16 * 1024) throw Error(Code::invalid_argument);
+}
+
 void job_submission(sdp_job_operation operation, const Json& request)
 {
     const bool schedule = operation == SDP_JOB_SCHEDULE_CREATE;
@@ -551,6 +567,20 @@ void job_submission(sdp_job_operation operation, const Json& request)
         task_field = "count";
         job_unsigned(request, "count", 1, 1'000'000'000);
     }
+    else if (schedule && kind == "sql_script")
+    {
+        task_field = "sql";
+        scheduled_sql_recipe(request);
+    }
+    else if (schedule && kind == "retrain")
+    {
+        task_field = "name";
+        decision_text(request, "name", 392);
+        history_token(request, "dataset_id");
+        if (request.contains("seed")) job_unsigned(request, "seed", 0, UINT32_MAX);
+        if (request.contains("options") && sdp::wire::object_field(request, "options").dump().size() > 1024)
+            throw Error(Code::invalid_argument);
+    }
     else throw Error(Code::invalid_argument);
     if (schedule)
     {
@@ -562,7 +592,7 @@ void job_submission(sdp_job_operation operation, const Json& request)
     {
         const auto& key = field.key();
         if (key == "request_token" || key == "kind" || (schedule && key == "rule") ||
-            key == task_field)
+            key == task_field || (kind == "retrain" && (key == "dataset_id" || key == "seed" || key == "options")))
             continue;
         if (kind == "compute" && key == "timeout_ms") job_unsigned(request, "timeout_ms", 100, 60'000);
         else if (kind == "compute" && key == "memory_mib") job_unsigned(request, "memory_mib", 16, 512);
