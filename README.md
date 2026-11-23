@@ -42,3 +42,10 @@ cpack --config out/build/windows-x64/CPackConfig.cmake -C Release -B out/package
 ```
 
 [Çevrimdışı bağımlılıklar, lisanslar ve kurulu paketle TLS entegrasyon testleri](BUILD.md) · [Server ve diğer SDK’lar](https://github.com/ParadiseIncDevelopers/StarDataParadiseServer) · [Sürüm notları](https://github.com/ParadiseIncDevelopers/StarDataParadiseDLLler/releases)
+
+## Lisans
+
+Özgün Native SDK, C/C++ başlıkları ve örnekleri [MIT](LICENSE) lisanslıdır.
+Telif ve izin bildirimi korunarak ticari kullanım, değiştirme ve yeniden
+dağıtıma izin verilir. Bağımlılıkların ayrı lisansları ve paketle taşınan
+bildirimleri [LICENSING.md](LICENSING.md) dosyasında açıklanır.

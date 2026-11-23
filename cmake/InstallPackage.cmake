@@ -28,7 +28,7 @@ install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/StarDataParadiseDLLlerConfig.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/StarDataParadiseDLLlerConfigVersion.cmake"
     DESTINATION "${package_directory}")
-install(FILES ABI.md COMPATIBILITY.md BUILD.md contracts/README.md contracts/sdp-contract-v1.zip
+install(FILES LICENSE LICENSING.md ABI.md COMPATIBILITY.md BUILD.md contracts/README.md contracts/sdp-contract-v1.zip
     DESTINATION "${CMAKE_INSTALL_DATADIR}/StarDataParadiseDLLler")
 install(FILES examples/cpp/CMakeLists.txt examples/cpp/main.cpp
     DESTINATION "${CMAKE_INSTALL_DATADIR}/StarDataParadiseDLLler/examples/cpp")
